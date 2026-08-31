@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# PinRoutes privileged helper: the only thing it knows how to do is add or
+# remove IPv4 static routes via ip(8), with every argument validated first.
+# The Linux analogue of the macOS app's SUID helper — installed root-owned to
+# /usr/local/bin with a NOPASSWD sudoers entry scoped to this one binary so
+# background re-applies are silent. Also runnable via pkexec when not installed.
+#
+# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)...
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+die() { echo "pinroutes-helper: $*" >&2; exit 2; }
+
+valid_ip() {
+  local ip=$1 o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1:4}"; do
+    ((10#$o <= 255)) || return 1
+  done
+}
+
+valid_cidr() {
+  local net=$1
+  [[ $net == */* ]] || return 1
+  valid_ip "${net%/*}" || return 1
+  [[ ${net#*/} =~ ^[0-9]{1,2}$ ]] || return 1
+  ((10#${net#*/} <= 32)) || return 1
+}
+
+(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)..."
+
+status=0
+while (($#)); do
+  action=$1
+  shift
+  case $action in
+  replace)
+    (($# >= 2)) || die "replace needs <cidr> <gateway>"
+    net=$1 gw=$2
+    shift 2
+    valid_cidr "$net" || die "invalid network: $net"
+    valid_ip "$gw" || die "invalid gateway: $gw"
+    ip route replace "$net" via "$gw" || status=1
+    ;;
+  delete)
+    (($# >= 1)) || die "delete needs <cidr>"
+    net=$1
+    shift
+    valid_cidr "$net" || die "invalid network: $net"
+    ip route del "$net" 2>/dev/null || true
+    ;;
+  *)
+    die "unknown action: $action"
+    ;;
+  esac
+done
+exit $status

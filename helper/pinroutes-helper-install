@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Installs (or removes) the PinRoutes helper system-wide. Run as root via
+# pkexec from the panel's "Install helper" action. Copies the helper to
+# /usr/local/bin and grants the invoking user a NOPASSWD sudoers entry scoped
+# to that one binary, so route re-applies never prompt for a password —
+# the Linux analogue of the macOS app's one-time SUID helper install.
+#
+# Usage: pinroutes-helper-install <helper-source> <username>
+#        pinroutes-helper-install --uninstall
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+DEST=/usr/local/bin/pinroutes-helper
+SUDOERS=/etc/sudoers.d/pinroutes
+
+die() { echo "pinroutes-helper-install: $*" >&2; exit 2; }
+
+((EUID == 0)) || die "must run as root (via pkexec)"
+
+if [[ ${1:-} == "--uninstall" ]]; then
+  rm -f "$DEST" "$SUDOERS"
+  echo "removed $DEST and $SUDOERS"
+  exit 0
+fi
+
+src=${1:-}
+user=${2:-}
+[[ -f $src ]] || die "helper source not found: $src"
+[[ $user =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*\$?$ ]] || die "invalid username: $user"
+id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
+
+install -o root -g root -m 0755 "$src" "$DEST"
+
+tmp=$(mktemp)
+printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$DEST" >"$tmp"
+if ! visudo -cf "$tmp" >/dev/null; then
+  rm -f "$tmp"
+  die "generated sudoers entry failed validation"
+fi
+install -o root -g root -m 0440 "$tmp" "$SUDOERS"
+rm -f "$tmp"
+echo "installed $DEST with a NOPASSWD sudoers entry for $user"
