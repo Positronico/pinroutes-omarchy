@@ -203,6 +203,66 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          // Pending approvals surface at the top where they can't be missed;
+          // the routine helper status stays in the HELPER section below.
+          CursorSurface {
+            visible: pin.helperInstalled && pin.unapprovedCount > 0
+            width: parent.width
+            implicitHeight: approveRow.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+            fill: root.hoverFill
+            bordered: true
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: pin.approveRoutes()
+            }
+
+            RowLayout {
+              id: approveRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(8)
+
+              Text {
+                text: "󰌾"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                Layout.alignment: Qt.AlignVCenter
+              }
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(1)
+
+                Text {
+                  Layout.fillWidth: true
+                  text: "Approve route changes"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  text: pin.unapprovedCount + (pin.unapprovedCount === 1 ? " route needs" : " routes need")
+                        + " root approval for silent re-apply"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+            }
+          }
+
           PanelSeparator { foreground: root.foreground }
 
           Column {
@@ -444,63 +504,6 @@ Panel {
                   Text {
                     Layout.fillWidth: true
                     text: "Click to copy, then run it once in a terminal. It installs the helper and approves your routes for silent re-apply."
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
-                  }
-                }
-              }
-            }
-
-            CursorSurface {
-              visible: pin.helperInstalled && pin.unapprovedCount > 0
-              width: parent.width
-              implicitHeight: approveRow.implicitHeight + Style.spacing.rowPaddingX
-              foreground: root.foreground
-              fill: root.hoverFill
-
-              MouseArea {
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: pin.approveRoutes()
-              }
-
-              RowLayout {
-                id: approveRow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                spacing: Style.space(8)
-
-                Text {
-                  text: "󰌾"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.heading
-                  Layout.alignment: Qt.AlignVCenter
-                }
-
-                ColumnLayout {
-                  Layout.fillWidth: true
-                  spacing: Style.space(1)
-
-                  Text {
-                    Layout.fillWidth: true
-                    text: "Approve route changes"
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                  }
-
-                  Text {
-                    Layout.fillWidth: true
-                    text: pin.unapprovedCount + (pin.unapprovedCount === 1 ? " route needs" : " routes need")
-                          + " root approval for silent re-apply"
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
