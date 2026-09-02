@@ -113,7 +113,13 @@ recover_interrupted() {
     return 0
   fi
   echo "recovering interrupted pinroutes transaction" >&2
-  local target backup expected
+  # Fail closed: the journal is removed only after every recorded restore/
+  # removal succeeded AND the directory durability barriers succeeded. A
+  # backup that has already been consumed by a previous recovery attempt
+  # (mv is atomic: content is in the backup or in the target) counts as
+  # restored; an operation that FAILS with its operands present retains the
+  # journal and every unrestored backup for the next attempt.
+  local target backup expected recovered=1
   while IFS='|' read -r target backup; do
     case $target in
     "$HELPER_DEST" | "$APPROVE_DEST" | "$ALLOW" | "$SUDOERS") ;;
@@ -121,23 +127,39 @@ recover_interrupted() {
     esac
     expected="$(dirname -- "$target")/.$(basename -- "$target").pinroutes-prev."
     if [[ $backup == "$expected"* && -f $backup && ! -L $backup ]]; then
-      mv -fT -- "$backup" "$target" 2>/dev/null || true
-    elif [[ $backup == "-" ]]; then
-      rm -f -- "$target" || true
+      mv -fT -- "$backup" "$target" 2>/dev/null || recovered=0
+    elif [[ $backup == "-" && -e $target ]]; then
+      rm -f -- "$target" 2>/dev/null || recovered=0
     fi
   done <"$JOURNAL"
-  rm -f -- "$JOURNAL"
-  sync "$ALLOW_DIR" 2>/dev/null || true
+  if ((recovered)); then
+    sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || recovered=0
+  fi
+  if ((recovered)); then
+    rm -f -- "$JOURNAL" 2>/dev/null || recovered=0
+    sync "$ALLOW_DIR" 2>/dev/null || true # journal removal durability; recovery is idempotent if lost
+  fi
+  if ((! recovered)); then
+    echo "pinroutes: recovery incomplete (restore or durability barrier failed); journal and backups retained" >&2
+  fi
 }
 
 # Remove crash leftovers matching our own staging/backup naming in the
-# managed directories. Runs only after recover_interrupted.
+# managed directories. Runs only after recover_interrupted, and NEVER while
+# a journal is still pending — its backups are the recovery data.
 sweep_leftovers() {
+  [[ ! -e $JOURNAL && ! -L $JOURNAL ]] || return 0
   local d
   for d in /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")"; do
     [[ -d $d ]] || continue
     rm -f -- "$d"/.pinroutes-stage.* "$d"/.*.pinroutes-prev.* 2>/dev/null || true
   done
+}
+
+# Both entry points refuse to proceed over an unrecoverable prior
+# transaction rather than compounding the damage.
+require_recovered() {
+  [[ ! -e $JOURNAL && ! -L $JOURNAL ]] || die "a previous interrupted transaction could not be recovered; inspect $JOURNAL and the .pinroutes-prev backups"
 }
 
 # A target may be replaced or removed only when it is absent or provably
@@ -168,6 +190,17 @@ self_source() {
 
 if [[ ${1:-} == "--uninstall" ]]; then
   recover_interrupted
+  if [[ -e $JOURNAL || -L $JOURNAL ]]; then
+    # Fail closed for files, but never fail open for privilege: revoking the
+    # grant is strictly privilege-reducing and consumes no recovery data
+    # (any sudoers backup remains for recovery to restore or inspect).
+    if [[ -e $SUDOERS ]] && target_ok "$SUDOERS"; then
+      if rm -f -- "$SUDOERS" 2>/dev/null; then
+        echo "removed $SUDOERS (grant revoked despite pending recovery)"
+      fi
+    fi
+    require_recovered
+  fi
   for f in "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"; do
     if [[ -e $f || -L $f ]]; then
       require_target "$f"
@@ -220,6 +253,7 @@ done
 
 # ---- recover any interrupted transaction, then refuse unknown targets ------
 recover_interrupted
+require_recovered
 require_target "$HELPER_DEST"
 require_target "$APPROVE_DEST"
 require_target "$SUDOERS"
@@ -263,8 +297,10 @@ publish() { # publish <staged> <target> — backups were all taken up front
   published+=("$2")
 }
 
+rollback_ok=1
 rollback() {
-  local i t entry backup target restored seen=" "
+  local i t entry backup target had_backup seen=" "
+  rollback_ok=1
   for ((i = ${#published[@]} - 1; i >= 0; i--)); do
     t=${published[i]}
     # A target can appear twice (sudoers: revoke, then new publish) — only
@@ -272,15 +308,22 @@ rollback() {
     # would be deleted again by the earlier entry.
     [[ $seen == *" $t "* ]] && continue
     seen="$seen$t "
-    restored=0
+    had_backup=0
     for entry in ${backups[@]+"${backups[@]}"}; do
       backup=${entry%%|*} target=${entry#*|}
-      if [[ $target == "$t" && -e $backup ]]; then
-        if mv -fT -- "$backup" "$target" 2>/dev/null; then restored=1; fi
+      if [[ $target == "$t" ]]; then
+        had_backup=1
+        # Fail closed: a failed restore keeps the backup AND the live file —
+        # never delete the only remaining copy of a target.
+        if [[ -e $backup ]]; then
+          mv -fT -- "$backup" "$target" 2>/dev/null || rollback_ok=0
+        fi
         break
       fi
     done
-    ((restored)) || rm -f -- "$t"
+    if ((! had_backup)); then
+      rm -f -- "$t" 2>/dev/null || rollback_ok=0
+    fi
   done
   published=()
 }
@@ -288,11 +331,23 @@ rollback() {
 cleanup() {
   if ((failed)); then
     rollback
-    rm -f -- "$JOURNAL" || true
+    # Same contract as recovery: the journal is dropped only after every
+    # restore AND the directory durability barrier succeeded.
+    if ((rollback_ok)) && sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null; then
+      rm -f -- "$JOURNAL" || true
+    else
+      rollback_ok=0
+      echo "pinroutes: rollback incomplete; journal and backups retained for recovery" >&2
+    fi
   fi
   local f entry
   for f in ${staged[@]+"${staged[@]}"}; do rm -f -- "$f" || true; done
-  for entry in ${backups[@]+"${backups[@]}"}; do rm -f -- "${entry%%|*}" || true; done
+  # Backups are recovery data while a journal is pending: delete them only
+  # once no journal remains (committed, or fully rolled back) and the last
+  # rollback (if any) completed.
+  if [[ ! -e $JOURNAL && ! -L $JOURNAL ]] && ((rollback_ok)); then
+    for entry in ${backups[@]+"${backups[@]}"}; do rm -f -- "${entry%%|*}" || true; done
+  fi
   return 0
 }
 # `|| true` so a hiccup inside the trap can never mask the script's real
@@ -472,7 +527,10 @@ journal_for() { # journal_for <target> -> "target|backup" or "target|-"
   journal_for "$ALLOW"
   journal_for "$SUDOERS"
 } >"$JOURNAL"
-sync "$JOURNAL" ${backups[@]+"${backups[@]%%|*}"} "$ALLOW_DIR" /usr/local/bin "$(dirname "$SUDOERS")" 2>/dev/null || true
+# Required durability barrier: if the journal and backups cannot be made
+# durable, publication must not start at all.
+sync "$JOURNAL" ${backups[@]+"${backups[@]%%|*}"} "$ALLOW_DIR" /usr/local/bin "$(dirname "$SUDOERS")" \
+  || die "durability barrier failed before publication; nothing was changed"
 
 # Revoke first on update: the old grant must never remain active over a
 # half-replaced installation. Rollback/recovery restores it from backup.
@@ -485,11 +543,20 @@ publish "$helper_tmp" "$HELPER_DEST"
 publish "$approve_tmp" "$APPROVE_DEST"
 publish "$allow_tmp" "$ALLOW"
 publish "$sudoers_tmp" "$SUDOERS"
-sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || true
+# Required durability barrier: the renames must be durable before the
+# journal is dropped, or a power loss could resurrect a half-published
+# state with no journal to recover it. Failure aborts and rolls back.
+sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" \
+  || die "durability barrier failed after publication; rolling back"
 
-# Commit: drop the journal, then (via cleanup) the backups.
-rm -f -- "$JOURNAL"
-sync "$ALLOW_DIR" 2>/dev/null || true
+# Commit: dropping the journal is the commit point. From that instant a
+# failure must never trigger an un-journaled rollback (which could delete
+# the only pre-transaction copies), so failed is cleared BEFORE the final
+# barrier; if that barrier fails, the transaction is already committed and
+# consistent — a resurfacing journal is handled idempotently by recovery.
+rm -f -- "$JOURNAL" || die "could not remove transaction journal; rolling back"
 failed=0
+sync "$ALLOW_DIR" \
+  || die "commit durability barrier failed (transaction committed; a resurfacing journal is recovered idempotently)"
 
 echo "installed $HELPER_DEST and $APPROVE_DEST; approved ${#pairs[@]} route(s) for $user"
