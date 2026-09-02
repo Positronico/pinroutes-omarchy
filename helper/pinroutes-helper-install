@@ -70,8 +70,13 @@ SUDOERS=/etc/sudoers.d/pinroutes
 ALLOW_DIR=/etc/pinroutes
 ALLOW=$ALLOW_DIR/routes.allow
 JOURNAL=$ALLOW_DIR/.pinroutes-txn
+JOURNAL_DONE=$ALLOW_DIR/.pinroutes-txn.committed
 MARKER='managed-by: pinroutes'
 MAX_ROUTES=100
+
+sha_of() { sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1; }
+
+txn_pending() { [[ -e $JOURNAL || -L $JOURNAL || -e $JOURNAL_DONE || -L $JOURNAL_DONE ]]; }
 
 die() { echo "pinroutes-approve: $*" >&2; exit 2; }
 
@@ -100,47 +105,94 @@ flock -n 9 || die "another pinroutes install/approve is already running"
 # without a journal means the transaction committed (or never started), so
 # sweeping it is correct.
 recover_interrupted() {
-  [[ -e $JOURNAL || -L $JOURNAL ]] || return 0
+  txn_pending || return 0
   # The journal is a root file-operation directive: act on it only when the
   # directory and the journal itself are exactly what this installer writes
   # (root-owned, non-symlink, dir not group/other-writable), and only for
   # the four fixed targets with correctly-named backups. Anything else is
   # discarded, not obeyed.
+  local jfile=$JOURNAL
+  [[ -e $JOURNAL || -L $JOURNAL ]] || jfile=$JOURNAL_DONE
   if ! [[ -d $ALLOW_DIR && ! -L $ALLOW_DIR && $(stat -c %u -- "$ALLOW_DIR") == 0 ]] \
     || (($(stat -c '8#%a' -- "$ALLOW_DIR") & 8#022)) \
-    || ! [[ -f $JOURNAL && ! -L $JOURNAL && $(stat -c %u -- "$JOURNAL") == 0 ]]; then
-    rm -f -- "$JOURNAL" 2>/dev/null || true
+    || ! [[ -f $jfile && ! -L $jfile && $(stat -c %u -- "$jfile") == 0 ]]; then
+    rm -f -- "$JOURNAL" "$JOURNAL_DONE" 2>/dev/null || true
     return 0
   fi
   echo "recovering interrupted pinroutes transaction" >&2
-  # Fail closed: the journal is removed only after every recorded restore/
-  # removal succeeded AND the directory durability barriers succeeded. A
-  # backup that has already been consumed by a previous recovery attempt
-  # (mv is atomic: content is in the backup or in the target) counts as
-  # restored; an operation that FAILS with its operands present retains the
-  # journal and every unrestored backup for the next attempt.
-  local target backup expected recovered=1
-  while IFS='|' read -r target backup; do
+  # Digest-verified, fail-closed recovery. Each journal line records
+  # target|backup|old_sha|new_sha, so every target's state is PROVEN, never
+  # assumed: a missing backup is only accepted when the target's content
+  # hashes to the recorded old or new digest. The decision is all-or-
+  # nothing — commit forward only if every target is provably NEW; roll
+  # back only if every target can be made provably OLD; anything else
+  # retains the journal and all surviving backups and refuses.
+  local target backup old new cur expected
+  local entries=() all_new=1 restorable=1
+  while IFS='|' read -r target backup old new; do
     case $target in
     "$HELPER_DEST" | "$APPROVE_DEST" | "$ALLOW" | "$SUDOERS") ;;
     *) continue ;;
     esac
     expected="$(dirname -- "$target")/.$(basename -- "$target").pinroutes-prev."
-    if [[ $backup == "$expected"* && -f $backup && ! -L $backup ]]; then
-      mv -fT -- "$backup" "$target" 2>/dev/null || recovered=0
-    elif [[ $backup == "-" && -e $target ]]; then
-      rm -f -- "$target" 2>/dev/null || recovered=0
+    if [[ $backup != "-" && $backup != "$expected"* ]]; then
+      continue # not a directive this installer writes
     fi
-  done <"$JOURNAL"
+    entries+=("$target|$backup|$old|$new")
+    cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
+    [[ $cur == "$new" ]] || all_new=0
+    if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
+      # Backup on hand: verify it really is the recorded old content.
+      [[ $(sha_of "$backup") == "$old" ]] || restorable=0
+    elif [[ $backup != "-" ]]; then
+      # Backup gone: acceptable for rollback only if the target already IS
+      # the old content (a previous recovery's verified restore).
+      [[ $cur == "$old" ]] || restorable=0
+    else
+      # Fresh target (no pre-transaction file): old state is ABSENT.
+      [[ $cur == ABSENT || $cur == "$new" ]] || restorable=0
+    fi
+  done <"$jfile"
+
+  local recovered=1
+  if ((all_new)) && [[ ${#entries[@]} -gt 0 ]]; then
+    : # Every target is provably NEW: the transaction completed — commit.
+  elif ((restorable)) && [[ ${#entries[@]} -gt 0 ]]; then
+    # Roll back to provably OLD everywhere.
+    local entry
+    for entry in "${entries[@]}"; do
+      # Once any restore failed, stop mutating (notably: never restore the
+      # sudoers grant over a half-restored file set).
+      ((recovered)) || break
+      IFS='|' read -r target backup old new <<<"$entry"
+      if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
+        mv -fT -- "$backup" "$target" 2>/dev/null || recovered=0
+      elif [[ $backup == "-" && -e $target ]]; then
+        rm -f -- "$target" 2>/dev/null || recovered=0
+      fi
+      # Verify the outcome is the recorded old state.
+      if ((recovered)); then
+        cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
+        if [[ $backup == "-" ]]; then
+          [[ $cur == ABSENT ]] || recovered=0
+        else
+          [[ $cur == "$old" ]] || recovered=0
+        fi
+      fi
+    done
+  else
+    recovered=0 # mixed/unprovable state: keep everything, refuse below
+  fi
+
   if ((recovered)); then
     sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || recovered=0
   fi
   if ((recovered)); then
-    rm -f -- "$JOURNAL" 2>/dev/null || recovered=0
-    sync "$ALLOW_DIR" 2>/dev/null || true # journal removal durability; recovery is idempotent if lost
+    rm -f -- "$JOURNAL" "$JOURNAL_DONE" 2>/dev/null || recovered=0
+    sync "$ALLOW_DIR" 2>/dev/null || true # marker removal durability; recovery is idempotent if lost
   fi
   if ((! recovered)); then
-    echo "pinroutes: recovery incomplete (restore or durability barrier failed); journal and backups retained" >&2
+    echo "pinroutes: recovery incomplete (state not provably consistent — possibly a legacy digest-less journal — or a restore/durability barrier failed); journal and backups retained" >&2
   fi
 }
 
@@ -148,7 +200,7 @@ recover_interrupted() {
 # managed directories. Runs only after recover_interrupted, and NEVER while
 # a journal is still pending — its backups are the recovery data.
 sweep_leftovers() {
-  [[ ! -e $JOURNAL && ! -L $JOURNAL ]] || return 0
+  if txn_pending; then return 0; fi
   local d
   for d in /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")"; do
     [[ -d $d ]] || continue
@@ -159,7 +211,9 @@ sweep_leftovers() {
 # Both entry points refuse to proceed over an unrecoverable prior
 # transaction rather than compounding the damage.
 require_recovered() {
-  [[ ! -e $JOURNAL && ! -L $JOURNAL ]] || die "a previous interrupted transaction could not be recovered; inspect $JOURNAL and the .pinroutes-prev backups"
+  if txn_pending; then
+    die "a previous interrupted transaction could not be recovered; inspect $JOURNAL(.committed) and the .pinroutes-prev backups"
+  fi
 }
 
 # A target may be replaced or removed only when it is absent or provably
@@ -190,7 +244,7 @@ self_source() {
 
 if [[ ${1:-} == "--uninstall" ]]; then
   recover_interrupted
-  if [[ -e $JOURNAL || -L $JOURNAL ]]; then
+  if txn_pending; then
     # Fail closed for files, but never fail open for privilege: revoking the
     # grant is strictly privilege-reducing and consumes no recovery data
     # (any sudoers backup remains for recovery to restore or inspect).
@@ -275,6 +329,7 @@ fi
 staged=()
 backups=()    # "backup|target" pairs
 published=()  # targets replaced so far
+declare -A OLD_SHA=() NEW_SHA=() # per-target content digests for the journal
 failed=1
 
 stage_into() { # stage_into <varname> <dir>
@@ -290,6 +345,8 @@ backup_target() { # backup_target <target> — taken for every existing target
   bak=$(dirname -- "$1")/.$(basename -- "$1").pinroutes-prev.$$
   cp -a -- "$1" "$bak"
   backups+=("$bak|$1")
+  OLD_SHA[$1]=$(sha_of "$bak")
+  [[ -n ${OLD_SHA[$1]} ]] || die "could not hash backup of $1"
 }
 
 publish() { # publish <staged> <target> — backups were all taken up front
@@ -342,10 +399,10 @@ cleanup() {
   fi
   local f entry
   for f in ${staged[@]+"${staged[@]}"}; do rm -f -- "$f" || true; done
-  # Backups are recovery data while a journal is pending: delete them only
-  # once no journal remains (committed, or fully rolled back) and the last
-  # rollback (if any) completed.
-  if [[ ! -e $JOURNAL && ! -L $JOURNAL ]] && ((rollback_ok)); then
+  # Backups are recovery data while any journal file is pending: delete
+  # them only once neither journal nor commit marker remains (committed and
+  # cleaned, or fully rolled back) and the last rollback (if any) completed.
+  if ! txn_pending && ((rollback_ok)); then
     for entry in ${backups[@]+"${backups[@]}"}; do rm -f -- "${entry%%|*}" || true; done
   fi
   return 0
@@ -510,16 +567,20 @@ backup_target "$HELPER_DEST"
 backup_target "$APPROVE_DEST"
 backup_target "$ALLOW"
 backup_target "$SUDOERS"
+NEW_SHA[$HELPER_DEST]=$(sha_of "$helper_tmp")
+NEW_SHA[$APPROVE_DEST]=$(sha_of "$approve_tmp")
+NEW_SHA[$ALLOW]=$(sha_of "$allow_tmp")
+NEW_SHA[$SUDOERS]=$(sha_of "$sudoers_tmp")
 
-journal_for() { # journal_for <target> -> "target|backup" or "target|-"
-  local entry
+journal_for() { # journal_for <target> -> "target|backup-or--|old_sha-or--|new_sha"
+  local entry bak="-"
   for entry in ${backups[@]+"${backups[@]}"}; do
     if [[ ${entry#*|} == "$1" ]]; then
-      printf '%s|%s\n' "$1" "${entry%%|*}"
-      return 0
+      bak=${entry%%|*}
+      break
     fi
   done
-  printf '%s|-\n' "$1"
+  printf '%s|%s|%s|%s\n' "$1" "$bak" "${OLD_SHA[$1]:--}" "${NEW_SHA[$1]}"
 }
 {
   journal_for "$HELPER_DEST"
@@ -549,14 +610,35 @@ publish "$sudoers_tmp" "$SUDOERS"
 sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" \
   || die "durability barrier failed after publication; rolling back"
 
-# Commit: dropping the journal is the commit point. From that instant a
-# failure must never trigger an un-journaled rollback (which could delete
-# the only pre-transaction copies), so failed is cleared BEFORE the final
-# barrier; if that barrier fails, the transaction is already committed and
-# consistent — a resurfacing journal is handled idempotently by recovery.
-rm -f -- "$JOURNAL" || die "could not remove transaction journal; rolling back"
+# Commit: atomically RENAME the journal to its committed marker — never an
+# ambiguous unlink — and make that durable before any recovery data is
+# released. Whichever name survives a crash, recovery digest-verifies the
+# real state; nothing is assumed from a file's absence.
+mv -fT -- "$JOURNAL" "$JOURNAL_DONE" || die "could not write commit marker; rolling back"
+if ! sync "$ALLOW_DIR"; then
+  # Uncertain commit durability: keep the marker and EVERY backup — the
+  # next run's recovery proves the state (all targets NEW after the durable
+  # post-publication barrier) and finishes the commit. No rollback: the
+  # publishes themselves are already durable.
+  failed=0
+  die "commit durability barrier failed; commit marker and backups retained for verification on the next run"
+fi
 failed=0
-sync "$ALLOW_DIR" \
-  || die "commit durability barrier failed (transaction committed; a resurfacing journal is recovered idempotently)"
+
+# Release recovery data, marker last. Failures here leave a provably-NEW
+# state under the marker that the next run's recovery finishes cleaning.
+housekeeping_ok=1
+for entry in ${backups[@]+"${backups[@]}"}; do
+  rm -f -- "${entry%%|*}" 2>/dev/null || housekeeping_ok=0
+done
+backups=() # cleanup() must not touch recovery data beyond this point
+sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || housekeeping_ok=0
+if ((housekeeping_ok)); then
+  rm -f -- "$JOURNAL_DONE" 2>/dev/null || housekeeping_ok=0
+  sync "$ALLOW_DIR" 2>/dev/null || true # marker removal durability; recovery is idempotent if lost
+fi
+if ((! housekeeping_ok)); then
+  echo "pinroutes: post-commit cleanup incomplete; the next run finishes it" >&2
+fi
 
 echo "installed $HELPER_DEST and $APPROVE_DEST; approved ${#pairs[@]} route(s) for $user"
