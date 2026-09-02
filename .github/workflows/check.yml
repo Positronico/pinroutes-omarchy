@@ -131,59 +131,82 @@ jobs:
           echo "privileged flow OK"
 
       - name: Digest-verified crash recovery matrix
-        # Simulates every persistence outcome a failed commit-durability sync
-        # can leave behind (resurrected journal / committed marker / partially
-        # persisted backup deletions) by crafting the exact on-disk states and
-        # verifying recovery proves all-old, all-new, or refuses.
+        # Simulates the persistence outcomes crashes/failed barriers can leave
+        # behind (resurrected journal / committed marker / partially persisted
+        # backup deletions / malformed journals) by crafting exact on-disk
+        # states; recovery must prove all-old, all-new, or refuse-and-retain.
         run: |
           set -u
           sha() { sha256sum "$1" | cut -d' ' -f1; }
           refute() { if "$@" >/dev/null 2>&1; then echo "FAIL(unexpectedly succeeded): $*"; exit 1; fi; }
+          expectrc() { local want=$1 rc=0; shift; "$@" >/dev/null 2>&1 || rc=$?; [ "$rc" -eq "$want" ] || { echo "FAIL($rc!=$want): $*"; exit 1; }; }
           sudo /bin/bash -c "$(cat helper/pinroutes-helper-install)" pinroutes-approve --approve 10.0.0.0/24 10.0.0.1
           A=/etc/pinroutes/routes.allow; J=/etc/pinroutes/.pinroutes-txn; JD=$J.committed
-          H=/usr/local/bin/pinroutes-helper
+          H=/usr/local/bin/pinroutes-helper; AP=/usr/local/bin/pinroutes-approve; S=/etc/sudoers.d/pinroutes
           bogus=1111111111111111111111111111111111111111111111111111111111111111
-          # (1) uncommitted journal, target clobbered, backup present -> the
-          # VERIFIED-RESTORE branch (recorded new_sha deliberately does not
-          # match the clobbered content, so commit-finish is unreachable)
-          sudo cp -a "$A" /etc/pinroutes/.routes.allow.pinroutes-prev.11
+          bak() { echo "$(dirname "$1")/.$(basename "$1").pinroutes-prev.$2"; }
+          iline() { local h; h=$(sudo sha256sum "$1" | cut -d" " -f1); printf '%s|%s|%s|%s\n' "$1" "$(bak "$1" zz)" "$h" "$h"; }
+          # (1) full journal; allow clobbered with real backup, unmatchable
+          # new digest -> VERIFIED-RESTORE branch, others identity no-ops
+          sudo cp -a "$A" "$(bak "$A" 11)"
           old=$(sha "$A")
           printf '# managed-by: pinroutes\nNEWCONTENT\n' | sudo tee "$A" >/dev/null
-          printf '%s\n' "$A|/etc/pinroutes/.routes.allow.pinroutes-prev.11|$old|$bogus" | sudo tee "$J" >/dev/null
+          { printf '%s|%s|%s|%s\n' "$A" "$(bak "$A" 11)" "$old" "$bogus"
+            iline "$H"; iline "$AP"; iline "$S"; } | sudo tee "$J" >/dev/null
           sudo /usr/local/bin/pinroutes-approve --approve 10.3.0.0/24 10.3.0.1 2>&1 | grep -qi recover
           grep -q 10.3.0.0 "$A"
           sudo test ! -e "$J"
-          # (1b) consumed-backup acceptance: backup path recorded but absent,
-          # target already holds the old content -> restore branch succeeds
+          # (1b) consumed-backup acceptance: recorded backup absent, target
+          # already old -> restore branch succeeds
           old=$(sha "$A")
-          printf '%s\n' "$A|/etc/pinroutes/.routes.allow.pinroutes-prev.gone|$old|$bogus" | sudo tee "$J" >/dev/null
+          { printf '%s|%s|%s|%s\n' "$A" "$(bak "$A" gone)" "$old" "$bogus"
+            iline "$H"; iline "$AP"; iline "$S"; } | sudo tee "$J" >/dev/null
           sudo /usr/local/bin/pinroutes-approve --approve 10.3.5.0/24 10.3.5.1 2>&1 | grep -qi recover
           grep -q 10.3.5.0 "$A"
           sudo test ! -e "$J"
-          # (2) committed marker + stale backup + target NEW -> commit-finish releases both
-          sudo cp -a "$A" /etc/pinroutes/.routes.allow.pinroutes-prev.12
-          printf '# managed-by: pinroutes\nOLD\n' | sudo tee /etc/pinroutes/.routes.allow.pinroutes-prev.12 >/dev/null
-          printf '%s\n' "$A|/etc/pinroutes/.routes.allow.pinroutes-prev.12|$(sha /etc/pinroutes/.routes.allow.pinroutes-prev.12)|$(sha "$A")" | sudo tee "$JD" >/dev/null
+          # (2) committed marker + stale backup + all targets NEW -> commit-finish
+          sudo cp -a "$A" "$(bak "$A" 12)"
+          printf '# managed-by: pinroutes\nOLD\n' | sudo tee "$(bak "$A" 12)" >/dev/null
+          { printf '%s|%s|%s|%s\n' "$A" "$(bak "$A" 12)" "$(sha "$(bak "$A" 12)")" "$(sha "$A")"
+            iline "$H"; iline "$AP"; iline "$S"; } | sudo tee "$JD" >/dev/null
           sudo /usr/local/bin/pinroutes-approve --approve 10.4.0.0/24 10.4.0.1 2>&1 | grep -qi recover
           sudo test ! -e "$JD"
-          refute sudo test -e /etc/pinroutes/.routes.allow.pinroutes-prev.12
-          # (3) mixed unprovable (one entry OLD-restorable, one NEW with vanished backup) -> refuse, retain
-          sudo cp -a "$A" /etc/pinroutes/.routes.allow.pinroutes-prev.13
-          printf '%s\n' \
-            "$A|/etc/pinroutes/.routes.allow.pinroutes-prev.13|$(sha "$A")|$bogus" \
-            "$H|/usr/local/bin/.pinroutes-helper.pinroutes-prev.13|$bogus|$(sha "$H")" | sudo tee "$J" >/dev/null
-          rc=0; sudo /usr/local/bin/pinroutes-approve --approve 10.5.0.0/24 10.5.0.1 2>/dev/null || rc=$?
-          [ "$rc" -eq 2 ]
-          sudo test -e "$J"
-          sudo test -e /etc/pinroutes/.routes.allow.pinroutes-prev.13
-          # (3b) uninstall under pending recovery revokes only the grant, keeps recovery data
-          rc=0; sudo /usr/local/bin/pinroutes-approve --uninstall 2>/dev/null || rc=$?
-          [ "$rc" -eq 2 ]
-          test ! -e /etc/sudoers.d/pinroutes
-          sudo test -e "$J"
-          test -x "$H"
-          # manual resolution then full uninstall
-          sudo mv /etc/pinroutes/.routes.allow.pinroutes-prev.13 "$A"
-          sudo rm "$J"
+          refute sudo test -e "$(bak "$A" 12)"
+          # (3) mixed unprovable -> refuse, retain journal + backup
+          sudo cp -a "$A" "$(bak "$A" 13)"
+          { printf '%s|%s|%s|%s\n' "$A" "$(bak "$A" 13)" "$(sha "$A")" "$bogus"
+            printf '%s|%s|%s|%s\n' "$H" "$(bak "$H" 13)" "$bogus" "$(sudo sha256sum "$H" | cut -d" " -f1)"
+            iline "$AP"; iline "$S"; } | sudo tee "$J" >/dev/null
+          expectrc 2 sudo /usr/local/bin/pinroutes-approve --approve 10.5.0.0/24 10.5.0.1
+          sudo test -e "$J"; sudo test -e "$(bak "$A" 13)"
+          # (3b) uninstall under pending recovery revokes only the grant
+          expectrc 2 sudo /usr/local/bin/pinroutes-approve --uninstall
+          test ! -e "$S"; sudo test -e "$J"; test -x "$H"
+          sudo rm "$J" "$(bak "$A" 13)"
+          # Re-approve to restore the grant for the malformed-journal cases
+          sudo /usr/local/bin/pinroutes-approve --approve 10.5.0.0/24 10.5.0.1
+          # (4) malformed/partial journals: every case refuses and retains
+          craft_refuse() { # craft_refuse <journal-content-via-stdin>
+            sudo tee "$J" >/dev/null
+            expectrc 2 sudo /usr/local/bin/pinroutes-approve --approve 10.6.0.0/24 10.6.0.1
+            sudo test -e "$J" || { echo "FAIL: journal discarded"; exit 1; }
+            sudo rm "$J"
+          }
+          { iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse                 # missing target
+          { iline "$H"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse    # duplicate target
+          { printf '%s|-|%s|%s\n' "$A" "$bogus" "$bogus"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse  # "-" backup with digest
+          { printf '%s|%s\n' "$A" "$(bak "$A" zz)"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse        # legacy 2-field line
+          { printf '/etc/shadow|%s|%s|%s\n' "$(bak "$A" zz)" "$bogus" "$bogus"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse  # foreign target
+          { printf '%s|%s|%s|%s|\n' "$A" "$(bak "$A" zz)" "$bogus" "$bogus"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse      # trailing separator
+          { printf '%s|%s/../evil|%s|%s\n' "$A" "$(bak "$A" zz)" "$bogus" "$bogus"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse # traversal backup
+          { printf '%s|/etc/pinroutes/.wrongname.5|%s|%s\n' "$A" "$bogus" "$bogus"; iline "$H"; iline "$AP"; iline "$S"; } | craft_refuse # non-canonical backup
+          # (5) revoke-removal failure on update: nothing mutated, old state
+          # (including the grant) fully intact
+          sudo mount --bind "$S" "$S"
+          expectrc 2 sudo /usr/local/bin/pinroutes-approve --approve 10.7.0.0/24 10.7.0.1
+          sudo umount "$S"
+          sudo test -e "$S"; refute grep -q 10.7.0.0 "$A"
+          sudo visudo -cf "$S"
+          # cleanup
           sudo /usr/local/bin/pinroutes-approve --uninstall
           echo "recovery matrix OK"

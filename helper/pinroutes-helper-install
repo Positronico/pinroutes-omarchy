@@ -112,11 +112,16 @@ recover_interrupted() {
   # the four fixed targets with correctly-named backups. Anything else is
   # discarded, not obeyed.
   local jfile=$JOURNAL
-  [[ -e $JOURNAL || -L $JOURNAL ]] || jfile=$JOURNAL_DONE
+  if ! [[ -e $JOURNAL || -L $JOURNAL ]]; then jfile=$JOURNAL_DONE; fi
   if ! [[ -d $ALLOW_DIR && ! -L $ALLOW_DIR && $(stat -c %u -- "$ALLOW_DIR") == 0 ]] \
     || (($(stat -c '8#%a' -- "$ALLOW_DIR") & 8#022)) \
     || ! [[ -f $jfile && ! -L $jfile && $(stat -c %u -- "$jfile") == 0 ]]; then
-    rm -f -- "$JOURNAL" "$JOURNAL_DONE" 2>/dev/null || true
+    # Fail closed: metadata we cannot trust is an UNRECOVERABLE pending
+    # transaction — retain it (and every backup) rather than discarding
+    # recovery state. Nothing unprivileged can plant these files: the
+    # directory must be root-owned and not group/other-writable to be used
+    # at all, and require_recovered blocks further transactions.
+    echo "pinroutes: journal or its directory failed validation; retained for manual inspection" >&2
     return 0
   fi
   echo "recovering interrupted pinroutes transaction" >&2
@@ -127,16 +132,40 @@ recover_interrupted() {
   # nothing — commit forward only if every target is provably NEW; roll
   # back only if every target can be made provably OLD; anything else
   # retains the journal and all surviving backups and refuses.
-  local target backup old new cur expected
-  local entries=() all_new=1 restorable=1
-  while IFS='|' read -r target backup old new; do
+  # The journal must describe one COMPLETE transaction: exactly one canonical
+  # entry per fixed target, each with a well-formed backup name and digests.
+  # Any extra, duplicate, missing, or malformed line makes the whole journal
+  # untrusted — it is retained (with every backup) and transactions are
+  # refused, never partially obeyed or swept.
+  local line target backup old new cur expected extra
+  local entries=() all_new=1 restorable=1 journal_valid=1 seen_targets=" "
+  while IFS= read -r line; do
+    IFS='|' read -r target backup old new extra <<<"$line"
     case $target in
     "$HELPER_DEST" | "$APPROVE_DEST" | "$ALLOW" | "$SUDOERS") ;;
-    *) continue ;;
+    *) journal_valid=0; break ;;
     esac
+    # The line must be EXACTLY four fields that reconstruct byte-for-byte
+    # (no trailing separators, CR, or padding survive this).
+    if [[ -n $extra || "$target|$backup|$old|$new" != "$line" || $seen_targets == *" $target "* ]]; then
+      journal_valid=0
+      break
+    fi
+    seen_targets="$seen_targets$target "
     expected="$(dirname -- "$target")/.$(basename -- "$target").pinroutes-prev."
-    if [[ $backup != "-" && $backup != "$expected"* ]]; then
-      continue # not a directive this installer writes
+    if [[ $backup != "-" ]]; then
+      if [[ $backup != "$expected"* || ${backup#"$expected"} == */* ]]; then
+        journal_valid=0 # non-canonical name, or a path-traversing suffix
+        break
+      fi
+    fi
+    if ! [[ ($old == "-" || $old =~ ^[0-9a-f]{64}$) && $new =~ ^[0-9a-f]{64}$ ]]; then
+      journal_valid=0
+      break
+    fi
+    if [[ $old == "-" && $backup != "-" ]] || [[ $old != "-" && $backup == "-" ]]; then
+      journal_valid=0 # a backup must have its digest recorded, and vice versa
+      break
     fi
     entries+=("$target|$backup|$old|$new")
     cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
@@ -153,11 +182,14 @@ recover_interrupted() {
       if ! [[ $cur == ABSENT || $cur == "$new" ]]; then restorable=0; fi
     fi
   done <"$jfile"
+  if [[ ${#entries[@]} -ne 4 ]]; then journal_valid=0; fi
 
   local recovered=1
-  if ((all_new)) && [[ ${#entries[@]} -gt 0 ]]; then
+  if ((! journal_valid)); then
+    recovered=0 # incomplete/malformed journal: retain everything, refuse
+  elif ((all_new)); then
     : # Every target is provably NEW: the transaction completed — commit.
-  elif ((restorable)) && [[ ${#entries[@]} -gt 0 ]]; then
+  elif ((restorable)); then
     # Roll back to provably OLD everywhere, with the grant-absent-first
     # invariant: if a sudoers entry is recorded, remove any live grant
     # BEFORE touching other targets, restore every non-sudoers target and
@@ -176,6 +208,10 @@ recover_interrupted() {
         # impossible there), and removing it would be unrecoverable.
         if [[ -e $target && ! ( $backup != "-" && ! -f $backup && $cur == "$old" ) ]]; then
           if ! rm -f -- "$target" 2>/dev/null; then recovered=0; fi
+          # The revocation must be durable before any other target is
+          # touched, or a power loss could resurrect the grant beside
+          # partially persisted later mutations.
+          if ((recovered)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then recovered=0; fi
         fi
       fi
     done
@@ -276,15 +312,17 @@ if [[ ${1:-} == "--uninstall" ]]; then
     # (any sudoers backup remains for recovery to restore or inspect).
     if [[ -e $SUDOERS ]] && target_ok "$SUDOERS"; then
       if rm -f -- "$SUDOERS" 2>/dev/null; then
+        sync "$(dirname "$SUDOERS")" 2>/dev/null || true
         echo "removed $SUDOERS (grant revoked despite pending recovery)"
       fi
     fi
     require_recovered
   fi
-  for f in "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"; do
+  for f in "$SUDOERS" "$HELPER_DEST" "$APPROVE_DEST" "$ALLOW"; do
     if [[ -e $f || -L $f ]]; then
       require_target "$f"
       rm -f -- "$f"
+      if [[ $f == "$SUDOERS" ]]; then sync "$(dirname "$SUDOERS")" 2>/dev/null || true; fi
       echo "removed $f"
     fi
   done
@@ -391,9 +429,18 @@ rollback() {
   # therefore never leaves a passwordless grant over a mixed component set.
   if [[ " ${published[*]-} " == *" $SUDOERS "* ]]; then
     touched_sudoers=1
-    if [[ -e $SUDOERS ]] && ! rm -f -- "$SUDOERS" 2>/dev/null; then rollback_ok=0; fi
+    if [[ -e $SUDOERS ]]; then
+      if ! rm -f -- "$SUDOERS" 2>/dev/null; then rollback_ok=0; fi
+      # Revocation durable before any other mutation (see publication).
+      if ((rollback_ok)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then rollback_ok=0; fi
+    fi
   fi
   for ((i = ${#published[@]} - 1; i >= 0; i--)); do
+    # Halt on the FIRST failure: continuing to rewrite targets after a
+    # failed revoke or restore could pair a live grant with a mixed set, or
+    # compound an already-inconsistent state. The journal and every backup
+    # are retained (cleanup gates on rollback_ok) for next-run recovery.
+    ((rollback_ok)) || break
     t=${published[i]}
     [[ $t == "$SUDOERS" ]] && continue # handled last, below
     # A target can appear twice — only the most recent action per target is
@@ -528,7 +575,7 @@ valid_cidr() {
 # the passwordless path must never run unrestricted, even if the allowlist
 # has been removed out from under it.
 enforce=0
-[[ -f $ALLOW || -n ${SUDO_USER:-} ]] && enforce=1
+if [[ -f $ALLOW || -n ${SUDO_USER:-} ]]; then enforce=1; fi
 
 allowed_pair() {
   [[ -f $ALLOW ]] || return 1
@@ -648,10 +695,14 @@ sync "$JOURNAL" ${backups[@]+"${backups[@]%%|*}"} "$ALLOW_DIR" /usr/local/bin "$
   || die "durability barrier failed before publication; nothing was changed"
 
 # Revoke first on update: the old grant must never remain active over a
-# half-replaced installation. Rollback/recovery restores it from backup.
+# half-replaced installation, and the revocation must be DURABLE before any
+# other target is touched — otherwise a power loss could resurrect the
+# grant beside partially persisted later renames. Rollback/recovery
+# restores it from backup.
 if [[ -e $SUDOERS ]]; then
-  rm -f -- "$SUDOERS"
+  rm -f -- "$SUDOERS" || die "could not revoke the existing grant; rolling back"
   published+=("$SUDOERS")
+  sync "$(dirname "$SUDOERS")" || die "durability barrier failed after grant revocation; rolling back"
 fi
 
 publish "$helper_tmp" "$HELPER_DEST"

@@ -59,7 +59,7 @@ valid_cidr() {
 # the passwordless path must never run unrestricted, even if the allowlist
 # has been removed out from under it.
 enforce=0
-[[ -f $ALLOW || -n ${SUDO_USER:-} ]] && enforce=1
+if [[ -f $ALLOW || -n ${SUDO_USER:-} ]]; then enforce=1; fi
 
 allowed_pair() {
   [[ -f $ALLOW ]] || return 1
