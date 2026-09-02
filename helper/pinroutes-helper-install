@@ -404,6 +404,7 @@ fi
 # target from its backup (or removes it if it did not exist), in reverse
 # order — the sudoers grant is published last, so no failure mode leaves a
 # privilege grant pointing at a mixed installation.
+# BEGIN-TXN-FUNCTIONS (extracted verbatim by the signal-injection test in CI)
 staged=()
 backups=()    # "backup|target" pairs
 published=()  # targets replaced so far
@@ -428,8 +429,13 @@ backup_target() { # backup_target <target> — taken for every existing target
 }
 
 publish() { # publish <staged> <target> — backups were all taken up front
-  mv -fT -- "$1" "$2"
+  # The rollback obligation is recorded BEFORE the live rename: a signal
+  # landing between the two finds either a not-yet-renamed target (whose
+  # "restore" is a no-op over identical old content, or an rm of a still-
+  # absent fresh target) or a completed rename with its obligation already
+  # tracked — never an untracked live mutation.
   published+=("$2")
+  mv -fT -- "$1" "$2"
 }
 
 rollback_ok=1
@@ -521,6 +527,7 @@ cleanup() {
 # `|| true` so a hiccup inside the trap can never mask the script's real
 # exit code (or fail a committed install).
 trap 'cleanup || true' EXIT
+# END-TXN-FUNCTIONS
 
 install -d -o root -g root -m 0755 "$ALLOW_DIR"
 # sudoers.d is a shared system directory: create it only if absent, never
@@ -716,8 +723,11 @@ sync "$JOURNAL" ${backups[@]+"${backups[@]%%|*}"} "$ALLOW_DIR" /usr/local/bin "$
 # grant beside partially persisted later renames. Rollback/recovery
 # restores it from backup.
 if [[ -e $SUDOERS ]]; then
-  rm -f -- "$SUDOERS" || die "could not revoke the existing grant; rolling back"
+  # Obligation recorded before the removal, for the same signal-window
+  # reason as publish(): rollback restoring the backup over a still-present
+  # identical grant is a harmless no-op.
   published+=("$SUDOERS")
+  rm -f -- "$SUDOERS" || die "could not revoke the existing grant; rolling back"
   sync "$(dirname "$SUDOERS")" || die "durability barrier failed after grant revocation; rolling back"
 fi
 

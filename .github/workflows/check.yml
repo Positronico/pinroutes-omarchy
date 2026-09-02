@@ -130,6 +130,100 @@ jobs:
           test ! -e /etc/sudoers.d/pinroutes
           echo "privileged flow OK"
 
+      - name: Signal-injection at publication boundaries
+        # Extracts the installer's transaction functions VERBATIM and drives
+        # a real 4-target publication in a scratch tree, delivering one
+        # SIGTERM deterministically at every boundary: before/after each live
+        # rename (including the commit-marker rename) and before/after the
+        # revoke rm. Invariant: whenever no journal file remains, all four
+        # targets are byte-exactly old or byte-exactly new - never mixed,
+        # never partial - and a new grant never sits over old components.
+        # Every kill case must also prove the driver actually died (rc=143),
+        # so the matrix can never go vacuous silently.
+        run: |
+          set -u
+          # Static ordering proof: obligations recorded before the mutation
+          grep -A7 '^publish() {' helper/pinroutes-helper-install | grep -B1 'mv -fT' | head -1 | grep -q 'published+='
+          grep -B3 'rm -f -- "\$SUDOERS" || die "could not revoke' helper/pinroutes-helper-install | grep -q 'published+='
+          [ "$(grep -c '^# BEGIN-TXN-FUNCTIONS' helper/pinroutes-helper-install)" = 1 ]
+          [ "$(grep -c '^# END-TXN-FUNCTIONS' helper/pinroutes-helper-install)" = 1 ]
+          sed -n '/# BEGIN-TXN-FUNCTIONS/,/# END-TXN-FUNCTIONS/p' helper/pinroutes-helper-install > /tmp/txn.sh
+          grep -q '^publish()' /tmp/txn.sh && grep -q '^rollback()' /tmp/txn.sh && grep -q "trap 'cleanup" /tmp/txn.sh
+          cat > /tmp/driver.sh <<'DRIVER'
+          set -euo pipefail
+          T=$1; MODE=$2; N=$3
+          SUDOERS=$T/sudoers.d/pinroutes; ALLOW_DIR=$T/pinroutes; ALLOW=$ALLOW_DIR/routes.allow
+          JOURNAL=$ALLOW_DIR/.pinroutes-txn; JOURNAL_DONE=$JOURNAL.committed
+          HELPER_DEST=$T/bin/helper; APPROVE_DEST=$T/bin/approve
+          txn_pending() { [[ -e $JOURNAL || -L $JOURNAL || -e $JOURNAL_DONE || -L $JOURNAL_DONE ]]; }
+          sha_of() { sha256sum -- "$1" 2>/dev/null | cut -d" " -f1; }
+          die() { echo "die: $*" >&2; exit 2; }
+          sync() { :; } # durability is asserted structurally, not by this test
+          MV_N=0; RM_N=0; FIRED=0
+          fire() { FIRED=1; kill -TERM $$; builtin read -t 5 || true; }
+          mv() { if [[ $FIRED == 0 && $MODE == beforemv && $((MV_N+1)) -eq $N ]]; then fire; fi
+                 command mv "$@"; MV_N=$((MV_N+1))
+                 if [[ $FIRED == 0 && $MODE == aftermv && $MV_N -eq $N ]]; then fire; fi
+                 return 0; }
+          rm() { if [[ $FIRED == 0 && $MODE == beforerm && $((RM_N+1)) -eq $N ]]; then fire; fi
+                 command rm "$@"; RM_N=$((RM_N+1))
+                 if [[ $FIRED == 0 && $MODE == afterrm && $RM_N -eq $N ]]; then fire; fi
+                 return 0; }
+          source /tmp/txn.sh
+          sha() { sha256sum "$1" | cut -d" " -f1; }
+          for t in "$HELPER_DEST" "$APPROVE_DEST" "$ALLOW" "$SUDOERS"; do backup_target "$t"; done
+          for t in "$HELPER_DEST" "$APPROVE_DEST" "$ALLOW" "$SUDOERS"; do
+            b="$(dirname "$t")/.$(basename "$t").pinroutes-prev.$$"
+            printf '%s|%s|%s|%s\n' "$t" "$b" "$(sha "$b")" "$(sha "$t.new")"
+          done > "$JOURNAL"
+          published+=("$SUDOERS"); rm -f -- "$SUDOERS"
+          publish "$HELPER_DEST.new" "$HELPER_DEST"
+          publish "$APPROVE_DEST.new" "$APPROVE_DEST"
+          publish "$ALLOW.new" "$ALLOW"
+          publish "$SUDOERS.new" "$SUDOERS"
+          mv -fT -- "$JOURNAL" "$JOURNAL_DONE"
+          failed=0
+          for entry in "${backups[@]}"; do command rm -f -- "${entry%%|*}"; done
+          backups=(); command rm -f -- "$JOURNAL_DONE"
+          DRIVER
+          declare -A OLDSHA NEWSHA
+          seed() { local T=$1 t
+            mkdir -p "$T/bin" "$T/pinroutes" "$T/sudoers.d"
+            for t in bin/helper bin/approve pinroutes/routes.allow sudoers.d/pinroutes; do
+              printf 'OLD-%s\n' "$t" > "$T/$t"; printf 'NEW-%s\n' "$t" > "$T/$t.new"
+              OLDSHA[$t]=$(sha256sum "$T/$t" | cut -d" " -f1)
+              NEWSHA[$t]=$(sha256sum "$T/$t.new" | cut -d" " -f1)
+            done; }
+          run_case() { # run_case <mode> <n> <expect-kill:1|0>
+            local T rc=0; T=$(mktemp -d); seed "$T"
+            bash /tmp/driver.sh "$T" "$1" "$2" >/dev/null 2>&1 || rc=$?
+            # Exact-code assertions keep the matrix from ever going vacuous:
+            # kill cases must die of SIGTERM (143), the unkilled control must
+            # complete cleanly - anything else (127 shim breakage, 2 die) is
+            # a harness fault, not coverage.
+            if [ "$3" = 1 ] && [ "$rc" -ne 143 ]; then echo "FAIL($1 $2): expected SIGTERM death, rc=$rc"; exit 1; fi
+            if [ "$3" = 0 ] && [ "$rc" -ne 0 ]; then echo "FAIL($1 $2): control run failed, rc=$rc"; exit 1; fi
+            local t old=0 new=0 other=0 cur
+            for t in bin/helper bin/approve pinroutes/routes.allow sudoers.d/pinroutes; do
+              if [ -e "$T/$t" ]; then cur=$(sha256sum "$T/$t" | cut -d" " -f1); else cur=ABSENT; fi
+              if [ "$cur" = "${OLDSHA[$t]}" ]; then old=$((old+1))
+              elif [ "$cur" = "${NEWSHA[$t]}" ]; then new=$((new+1))
+              else other=$((other+1)); fi
+            done
+            local j=0
+            if [ -e "$T/pinroutes/.pinroutes-txn" ] || [ -e "$T/pinroutes/.pinroutes-txn.committed" ]; then j=1; fi
+            if [ "$j" -eq 0 ]; then
+              if [ "$other" -ne 0 ] || { [ "$old" -ne 4 ] && [ "$new" -ne 4 ]; }; then
+                echo "FAIL($1 $2): journal released but state not all-old/all-new (old=$old new=$new other=$other)"; exit 1
+              fi
+            fi
+            command rm -rf "$T"; echo "ok: $1 $2 rc=$rc"
+          }
+          for n in 1 2 3 4 5; do run_case beforemv "$n" 1; run_case aftermv "$n" 1; done
+          run_case beforerm 1 1; run_case afterrm 1 1
+          run_case none 0 0   # unkilled control: full commit, all-new, no journal
+          echo "signal injection OK"
+
       - name: Digest-verified crash recovery matrix
         # Simulates the persistence outcomes crashes/failed barriers can leave
         # behind (resurrected journal / committed marker / partially persisted
