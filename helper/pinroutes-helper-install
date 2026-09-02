@@ -1,42 +1,61 @@
-#!/usr/bin/env bash
-# PinRoutes privileged installer / route approver. Run as root via pkexec
-# from the panel's "Install helper" / "Approve route changes" actions.
+#!/bin/bash
+# PinRoutes privileged installer / route approver.
 #
-#   pinroutes-helper-install --approve [<cidr> <gateway>]...
-#       Installs the helper (embedded below — nothing is copied from a
-#       user-writable path), writes the root-owned allowlist with exactly
-#       the given route pairs, and grants the invoking user a NOPASSWD
-#       sudoers entry scoped to the installed helper. The invoking user is
-#       taken from PKEXEC_UID (set by pkexec) or SUDO_UID — never from
-#       arguments or ambient environment strings.
+# Trust model: root must never execute a file from the user-writable plugin
+# checkout. On the FIRST approval the shell passes this script's text — read
+# into shell memory at plugin load — as an argv constant to the fixed system
+# interpreter (`pkexec /bin/bash -c <text> pinroutes-approve --approve ...`),
+# and this script then installs ITSELF root-owned to
+# /usr/local/bin/pinroutes-approve (recovering its own text from
+# $BASH_EXECUTION_STRING, which bash sets to the -c command string). Every
+# later approval runs that fixed, root-owned copy directly; nothing under the
+# user's home is opened by root again.
 #
-#   pinroutes-helper-install --uninstall
-#       Removes the helper, the sudoers entry, and the allowlist.
+#   pinroutes-approve --approve [<cidr> <gateway>]...
+#       Installs the route helper (embedded below), writes the root-owned
+#       allowlist with exactly the given route pairs, installs this approver
+#       root-owned, and grants the invoking user a NOPASSWD sudoers entry
+#       scoped to the installed helper with a pinned secure_path. The
+#       invoking user is taken from PKEXEC_UID (set by pkexec) or SUDO_UID —
+#       never from arguments or ambient environment strings.
 #
-# The helper is embedded as a quoted heredoc so root never executes or copies
-# content from a path the user can rewrite after approval. Keep the embedded
-# copy in sync with helper/pinroutes-helper.
+#   pinroutes-approve --uninstall
+#       Removes the helper, the approver, the sudoers entry, and the
+#       allowlist.
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 HELPER_DEST=/usr/local/bin/pinroutes-helper
+APPROVE_DEST=/usr/local/bin/pinroutes-approve
 SUDOERS=/etc/sudoers.d/pinroutes
 ALLOW_DIR=/etc/pinroutes
 ALLOW=$ALLOW_DIR/routes.allow
 MAX_ROUTES=100
 
-die() { echo "pinroutes-helper-install: $*" >&2; exit 2; }
+die() { echo "pinroutes-approve: $*" >&2; exit 2; }
 
 ((EUID == 0)) || die "must run as root (via pkexec)"
 
+# Own source text: from the -c command string when bootstrapping, from the
+# root-owned installed path afterwards. Never from a user-writable file.
+self_source() {
+  if [[ -n ${BASH_EXECUTION_STRING:-} ]]; then
+    local text=$BASH_EXECUTION_STRING
+    [[ $text == '#!'* ]] || text=$'#!/bin/bash\n'$text
+    printf '%s\n' "${text%$'\n'}"
+  else
+    cat "$0"
+  fi
+}
+
 if [[ ${1:-} == "--uninstall" ]]; then
-  rm -f "$HELPER_DEST" "$SUDOERS" "$ALLOW"
+  rm -f "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"
   rmdir "$ALLOW_DIR" 2>/dev/null || true
-  echo "removed $HELPER_DEST, $SUDOERS and $ALLOW"
+  echo "removed $HELPER_DEST, $APPROVE_DEST, $SUDOERS and $ALLOW"
   exit 0
 fi
 
-[[ ${1:-} == "--approve" ]] || die "usage: pinroutes-helper-install --approve [<cidr> <gateway>]... | --uninstall"
+[[ ${1:-} == "--approve" ]] || die "usage: pinroutes-approve --approve [<cidr> <gateway>]... | --uninstall"
 shift
 
 # The invoking user comes from the privilege-escalation mechanism itself,
@@ -76,9 +95,10 @@ done
 
 # ---- embedded helper (keep in sync with helper/pinroutes-helper) -----------
 helper_tmp=$(mktemp)
-trap 'rm -f "$helper_tmp"' EXIT
+approve_tmp=$(mktemp)
+trap 'rm -f "$helper_tmp" "$approve_tmp"' EXIT
 cat >"$helper_tmp" <<'EMBEDDED_HELPER'
-#!/usr/bin/env bash
+#!/bin/bash
 # PinRoutes privileged helper: the only thing it knows how to do is add or
 # remove IPv4 static routes via ip(8), and only routes the user has approved.
 #
@@ -184,6 +204,9 @@ EMBEDDED_HELPER
 
 install -o root -g root -m 0755 "$helper_tmp" "$HELPER_DEST"
 
+self_source >"$approve_tmp"
+install -o root -g root -m 0755 "$approve_tmp" "$APPROVE_DEST"
+
 install -d -o root -g root -m 0755 "$ALLOW_DIR"
 allow_tmp=$(mktemp)
 printf '%s\n' "${pairs[@]:-}" | sed '/^$/d' >"$allow_tmp"
@@ -192,7 +215,10 @@ rm -f "$allow_tmp"
 
 install -d -o root -g root -m 0750 "$(dirname "$SUDOERS")"
 sudoers_tmp=$(mktemp)
-printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_DEST" >"$sudoers_tmp"
+{
+  printf 'Defaults!%s secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\n' "$HELPER_DEST"
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_DEST"
+} >"$sudoers_tmp"
 if ! visudo -cf "$sudoers_tmp" >/dev/null; then
   rm -f "$sudoers_tmp"
   die "generated sudoers entry failed validation"
@@ -200,4 +226,4 @@ fi
 install -o root -g root -m 0440 "$sudoers_tmp" "$SUDOERS"
 rm -f "$sudoers_tmp"
 
-echo "installed $HELPER_DEST; approved ${#pairs[@]} route(s) for $user"
+echo "installed $HELPER_DEST and $APPROVE_DEST; approved ${#pairs[@]} route(s) for $user"

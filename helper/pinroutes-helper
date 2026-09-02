@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # PinRoutes privileged helper: the only thing it knows how to do is add or
 # remove IPv4 static routes via ip(8), and only routes the user has approved.
 #

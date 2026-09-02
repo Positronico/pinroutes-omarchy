@@ -53,8 +53,19 @@ Item {
   readonly property bool busy: applyProcess.running || tableProcess.running || installProcess.running
 
   readonly property string helperDest: "/usr/local/bin/pinroutes-helper"
+  readonly property string approveDest: "/usr/local/bin/pinroutes-approve"
   readonly property string localHelperPath: Qt.resolvedUrl("helper/pinroutes-helper").toString().replace("file://", "")
   readonly property string installScriptPath: Qt.resolvedUrl("helper/pinroutes-helper-install").toString().replace("file://", "")
+
+  // Root never executes files from this user-writable checkout. The two
+  // scripts are read into memory once at plugin load; privileged runs pass
+  // that captured text as an argv constant to the fixed system interpreter
+  // (`pkexec /bin/bash -c <text> ...`). The first approval installs the
+  // approver root-owned at /usr/local/bin/pinroutes-approve, and every later
+  // approval executes that fixed trusted component instead.
+  property string _helperScript: ""
+  property string _installerScript: ""
+  property bool approveToolInstalled: false
   readonly property string stateHelper: Qt.resolvedUrl("stateio.py").toString().replace("file://", "")
   readonly property string statePath: {
     var base = Quickshell.env("XDG_CONFIG_HOME")
@@ -206,6 +217,7 @@ Item {
   function refresh() {
     if (!loaded || tableProcess.running) return
     tableProcess.running = true
+    tableDeadline.restart()
   }
 
   function handleTable(entries) {
@@ -299,12 +311,13 @@ Item {
     if (applyProcess.running || args.length === 0) return
     var cmd
     if (helperInstalled) cmd = ["sudo", "-n", helperDest].concat(args)
-    else if (interactive) cmd = ["pkexec", localHelperPath].concat(args)
+    else if (interactive && _helperScript !== "") cmd = ["pkexec", "/bin/bash", "-c", _helperScript, "pinroutes-helper"].concat(args)
     else return
     lastError = ""
     _silentApply = !interactive
     applyProcess.command = cmd
     applyProcess.running = true
+    applyDeadline.restart()
   }
 
   // ---- helper install ------------------------------------------------------
@@ -312,6 +325,7 @@ Item {
   function checkHelper() {
     if (helperCheckProcess.running) return
     helperCheckProcess.running = true
+    helperCheckDeadline.restart()
   }
 
   // One authenticated prompt installs the helper and approves the current
@@ -319,12 +333,21 @@ Item {
   // allowlist, so later silent applies can only touch these exact pairs.
   function approveRoutes() {
     if (installProcess.running) return
-    var cmd = ["pkexec", installScriptPath, "--approve"]
+    var cmd
+    if (approveToolInstalled) {
+      cmd = ["pkexec", approveDest, "--approve"]
+    } else if (_installerScript !== "") {
+      cmd = ["pkexec", "/bin/bash", "-c", _installerScript, "pinroutes-approve", "--approve"]
+    } else {
+      flashStatus("Still loading — try again in a moment")
+      return
+    }
     for (var i = 0; i < routes.length; i++) {
       cmd.push(routes[i].network, routes[i].gateway)
     }
     installProcess.command = cmd
     installProcess.running = true
+    installDeadline.restart()
   }
 
   function installHelper() {
@@ -334,8 +357,11 @@ Item {
   function uninstallHelper() {
     if (installProcess.running) return
     _pendingApply = []
-    installProcess.command = ["pkexec", installScriptPath, "--uninstall"]
+    if (approveToolInstalled) installProcess.command = ["pkexec", approveDest, "--uninstall"]
+    else if (_installerScript !== "") installProcess.command = ["pkexec", "/bin/bash", "-c", _installerScript, "pinroutes-approve", "--uninstall"]
+    else return
     installProcess.running = true
+    installDeadline.restart()
   }
 
   // ---- persistence ---------------------------------------------------------
@@ -405,12 +431,16 @@ Item {
 
   Process {
     id: tableProcess
-    command: ["ip", "-j", "-4", "route", "show"]
+    // head enforces the output bound at the producer: an absurdly large
+    // table SIGPIPEs ip, pipefail turns that into a nonzero exit, and the
+    // truncated output is discarded instead of parsed.
+    command: ["bash", "-c", "set -o pipefail; ip -j -4 route show | head -c 4194304"]
     stdout: StdioCollector { id: tableStdout; waitForEnd: true }
     onExited: function(exitCode) {
+      tableDeadline.stop()
       if (exitCode !== 0) return
       var text = String(tableStdout.text || "[]")
-      if (text.length > 4 * 1024 * 1024) {
+      if (text.length >= 4 * 1024 * 1024) {
         console.warn("pinroutes: route table output unexpectedly large, skipping")
         return
       }
@@ -430,6 +460,7 @@ Item {
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { id: applyStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      applyDeadline.stop()
       if (exitCode === 0) {
         root.flashStatus(root._silentApply ? "" : "Routes applied")
         if (root._silentApply) root.notify("normal", "Routes re-applied", "PinRoutes restored missing routes")
@@ -455,21 +486,25 @@ Item {
   Process {
     id: helperCheckProcess
     command: ["bash", "-c",
-      "test -x " + root.helperDest + " && sudo -n -l " + root.helperDest + " >/dev/null 2>&1"
-      + " && { echo __PINROUTES_OK__; head -c 65536 /etc/pinroutes/routes.allow 2>/dev/null; }"]
+      "test -x " + root.helperDest + " && sudo -n -l " + root.helperDest + " >/dev/null 2>&1 && echo __PINROUTES_OK__; "
+      + "test -x " + root.approveDest + " && echo __PINROUTES_APPROVE__; "
+      + "head -c 65536 /etc/pinroutes/routes.allow 2>/dev/null; true"]
     stdout: StdioCollector { id: helperCheckStdout; waitForEnd: true }
     onExited: function(exitCode) {
+      helperCheckDeadline.stop()
       var lines = String(helperCheckStdout.text || "").split("\n")
-      var installed = exitCode === 0 && lines[0] === "__PINROUTES_OK__"
+      var installed = false
+      var approveTool = false
       var approved = {}
-      if (installed) {
-        for (var i = 1; i < lines.length && i <= 200; i++) {
-          var line = lines[i].trim()
-          if (line !== "") approved[line] = true
-        }
+      for (var i = 0; i < lines.length && i <= 200; i++) {
+        var line = lines[i].trim()
+        if (line === "__PINROUTES_OK__") installed = true
+        else if (line === "__PINROUTES_APPROVE__") approveTool = true
+        else if (line !== "") approved[line] = true
       }
       root.helperInstalled = installed
-      root.approvedMap = approved
+      root.approveToolInstalled = approveTool
+      root.approvedMap = installed ? approved : {}
       // An approval was waiting on this recheck: retry the apply that
       // triggered it, now allowed through the sudo path.
       if (root._pendingApply.length > 0) {
@@ -480,10 +515,30 @@ Item {
     }
   }
 
+  // Script sources are captured once at plugin load; see the property block.
+  Process {
+    id: helperScriptReader
+    command: ["cat", root.localHelperPath]
+    stdout: StdioCollector { id: helperScriptOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root._helperScript = String(helperScriptOut.text || "")
+    }
+  }
+
+  Process {
+    id: installerScriptReader
+    command: ["cat", root.installScriptPath]
+    stdout: StdioCollector { id: installerScriptOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root._installerScript = String(installerScriptOut.text || "")
+    }
+  }
+
   Process {
     id: installProcess
     stderr: StdioCollector { id: installStderr; waitForEnd: true }
     onExited: function(exitCode) {
+      installDeadline.stop()
       if (exitCode === 0) {
         root.flashStatus("Routes approved")
         root.lastError = ""
@@ -559,7 +614,36 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  // Deadlines: every short-lived process is reaped if it overstays, so a
+  // wedged ip/sudo call can never permanently jam refreshes or applies. The
+  // pkexec-backed ones get generous windows for the auth dialog.
+  Timer {
+    id: tableDeadline
+    interval: 15000
+    onTriggered: if (tableProcess.running) tableProcess.running = false
+  }
+
+  Timer {
+    id: helperCheckDeadline
+    interval: 15000
+    onTriggered: if (helperCheckProcess.running) helperCheckProcess.running = false
+  }
+
+  Timer {
+    id: applyDeadline
+    interval: 300000
+    onTriggered: if (applyProcess.running) applyProcess.running = false
+  }
+
+  Timer {
+    id: installDeadline
+    interval: 300000
+    onTriggered: if (installProcess.running) installProcess.running = false
+  }
+
   Component.onCompleted: {
+    helperScriptReader.running = true
+    installerScriptReader.running = true
     checkHelper()
     stateReader.running = true
   }

@@ -56,20 +56,22 @@ Changing routes requires root, so this plugin has a deliberately small, policy-b
 - **`helper/pinroutes-helper`** — a bash script whose entire command surface is `ip route replace <cidr> via <gateway>` and `ip route del <cidr>`, capped at 128 operations per invocation. Two validation layers:
   1. *Syntax*: every argument must be a well-formed IPv4 CIDR / address (strict regex, checked before `ip` runs).
   2. *Policy*: whenever the root-owned allowlist `/etc/pinroutes/routes.allow` exists — and always when running under sudo — each operation must exactly match an approved `<network> <gateway>` pair. The passwordless path **fails closed**: under sudo with no allowlist, everything is refused. This is what stops an arbitrary same-user process from using the NOPASSWD entry to hijack the default route (`0.0.0.0/0`, or the `/1`-pair equivalent) or any other unapproved route.
-- **"Install helper" / "Approve route changes"** runs `helper/pinroutes-helper-install --approve <pairs...>` via `pkexec`. The installer is self-contained: the helper it installs is **embedded in the installer itself** (root never copies a second user-writable file), the invoking user is derived from **`PKEXEC_UID`/`SUDO_UID`** (never from arguments or ambient environment strings), route pairs are re-validated and capped at 100, and it writes:
-  - `/usr/local/bin/pinroutes-helper` (root:root 0755)
+- **Root never executes a file from the plugin checkout.** The plugin dir is user-writable, so a privileged executable read from it could be swapped between authentication and root opening it (a TOCTOU root-code-execution path). Instead the two scripts are read into the shell's memory once at load, and privileged runs pass that captured text as an **argv constant to the fixed system interpreter**: `pkexec /bin/bash -c "<script text>" …`. `/bin/bash` is trusted and immutable; the script text is data, not a path root resolves.
+- **"Install helper" / "Approve route changes"** runs the installer this way with `--approve <pairs...>`. On first run it installs *itself* root-owned to `/usr/local/bin/pinroutes-approve` (recovering its own text from `$BASH_EXECUTION_STRING`), and every later approval executes that fixed, root-owned component directly. The installer derives the invoking user from **`PKEXEC_UID`/`SUDO_UID`** (never argv or ambient env), re-validates and caps route pairs (100), embeds the route helper (root never copies a second mutable file), and writes:
+  - `/usr/local/bin/pinroutes-helper` and `/usr/local/bin/pinroutes-approve` (root:root 0755)
   - `/etc/pinroutes/routes.allow` (root:root 0644) — exactly the approved pairs
-  - `/etc/sudoers.d/pinroutes` (root:root 0440, `visudo -cf`-validated): `<you> ALL=(root) NOPASSWD: /usr/local/bin/pinroutes-helper`
+  - `/etc/sudoers.d/pinroutes` (root:root 0440, `visudo -cf`-validated): a pinned `secure_path` for the helper plus `<you> ALL=(root) NOPASSWD: /usr/local/bin/pinroutes-helper`
 
   Adding or editing a route later requires one re-approval prompt; until then the new route is applied only through per-operation `pkexec` and is marked "not yet approved" in the panel.
-- **Without the helper installed**, user-initiated applies run the in-repo helper via `pkexec` (one themed auth prompt per operation — each invocation individually authenticated, so syntax-only validation applies). The background monitor *never* invokes pkexec — if it can't fix a route silently, it only notifies.
-- **State I/O** (`stateio.py`) opens the config with `O_NOFOLLOW|O_NONBLOCK` and refuses anything that is not a regular, self-owned, single-link file; writes are atomic (same-dir temp + rename) and payloads bounded at 1 MB.
-- **Nothing else**: no network access, no downloads, no bundled binaries, no services. The plugin only ever executes `ip`, `notify-send`, `python3 stateio.py`, and the helper via `sudo -n`/`pkexec`. Route counts (100), name lengths (100), helper operations (128), parsed process output, and monitor restarts (exponential backoff) are all bounded.
+- **Trusted interpreter and PATH.** Both scripts use `#!/bin/bash` (absolute, not `/usr/bin/env`), and the installed helper's sudoers entry pins `secure_path`, so the NOPASSWD path never depends on the caller's `PATH` or ambient sudo policy.
+- **Without the helper installed**, user-initiated applies run the in-repo helper text through the same `pkexec /bin/bash -c` handoff (one themed auth prompt per operation — each invocation individually authenticated, so syntax-only validation applies). The background monitor *never* invokes pkexec — if it can't fix a route silently, it only notifies.
+- **State I/O** (`stateio.py`) opens the config's parent directory once (`O_DIRECTORY|O_NOFOLLOW`), validates it (directory, self-owned, not group/other-writable), and anchors every subsequent open/rename/unlink to that held fd so no path component is re-resolved between check and use. The file must be a regular, self-owned, single-link file (`O_NOFOLLOW|O_NONBLOCK`); writes are atomic (`O_EXCL` temp + `fsync` + rename within the held fd) and an over-limit payload is a hard error, never a silent truncation.
+- **Nothing else**: no network access, no downloads, no bundled binaries, no services. The plugin only ever executes `ip`, `notify-send`, `python3 stateio.py`, `/bin/bash -c <own script text>`, and the helper via `sudo -n`. Route counts (100), name lengths (100), helper operations (128), route-table output (producer-side `head` cap), and monitor restarts (exponential backoff) are all bounded, and every short-lived process has a watchdog deadline.
 
 Uninstall the helper from the panel, or manually:
 
 ```bash
-sudo rm /usr/local/bin/pinroutes-helper /etc/sudoers.d/pinroutes /etc/pinroutes/routes.allow
+sudo /usr/local/bin/pinroutes-approve --uninstall
 ```
 
 ## Dependencies

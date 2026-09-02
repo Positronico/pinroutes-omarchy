@@ -3,11 +3,14 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Shell syntax
         run: |
@@ -28,27 +31,61 @@ jobs:
           jq -e '.schemaVersion == 1 and .id == "pinroutes" and (.version | type) == "string"
                  and (.kinds | length) > 0 and (.entryPoints | type) == "object"' manifest.json
 
-      - name: Helper allowlist enforcement
-        # Only denial paths run here — they are refused before ip(8) executes,
-        # so the runner's routing table is never touched.
+      - name: State I/O hardening
         run: |
           set -u
-          h=./helper/pinroutes-helper
-          sudo mkdir -p /etc/pinroutes
-          printf '10.0.0.0/24 10.0.0.1\n' | sudo tee /etc/pinroutes/routes.allow >/dev/null
-          expect() { # expect <code> <args...>
+          S=$PWD/stateio.py
+          cd "$(mktemp -d)"
+          mkdir -p cfg
+          echo '{"ok":true}' | python3 "$S" write cfg/state.json
+          [ "$(python3 "$S" read cfg/state.json)" = '{"ok":true}' ]
+          ln -s /etc/hostname cfg/link.json
+          ! python3 "$S" read cfg/link.json 2>/dev/null
+          mkfifo cfg/fifo.json
+          timeout 3 python3 "$S" read cfg/fifo.json 2>/dev/null && exit 1 || [ $? -ne 124 ]
+          touch cfg/a.json && ln cfg/a.json cfg/hard.json
+          ! python3 "$S" read cfg/hard.json 2>/dev/null
+          head -c 1048577 /dev/zero | python3 "$S" write cfg/state.json 2>/dev/null && exit 1
+          [ "$(python3 "$S" read cfg/state.json)" = '{"ok":true}' ]  # over-limit write left old content intact
+          echo "stateio OK"
+
+      - name: Bootstrap, allowlist enforcement, fixed-component re-approve
+        # Denial paths only ever run — they are refused before ip(8)
+        # executes, so the runner's routing table is never touched.
+        run: |
+          set -u
+          expect() { # expect <code> <cmd...>
             local want=$1 rc=0; shift
-            sudo "$h" "$@" 2>/dev/null || rc=$?
-            [ "$rc" -eq "$want" ] || { echo "FAIL: $* -> $rc (want $want)"; exit 1; }
+            "$@" 2>/dev/null || rc=$?
+            [ "$rc" -eq "$want" ] || { echo "FAIL($rc!=$want): $*"; exit 1; }
           }
-          # unapproved routes must be denied (exit 3) before ip runs
-          expect 3 replace 0.0.0.0/0 9.9.9.9
-          expect 3 replace 0.0.0.0/1 9.9.9.9
-          expect 3 replace 10.0.0.0/24 6.6.6.6
-          expect 3 delete 192.168.0.0/16
-          # sudo path without allowlist must fail closed
+          # Bootstrap exactly as the shell does: script text as an argv
+          # constant to the fixed system interpreter, never a checkout path.
+          sudo /bin/bash -c "$(cat helper/pinroutes-helper-install)" pinroutes-approve \
+            --approve 10.0.0.0/24 10.0.0.1
+          test -x /usr/local/bin/pinroutes-helper
+          test -x /usr/local/bin/pinroutes-approve
+          grep -qxF '10.0.0.0/24 10.0.0.1' /etc/pinroutes/routes.allow
+          sudo grep -q 'secure_path' /etc/sudoers.d/pinroutes
+          sudo visudo -cf /etc/sudoers.d/pinroutes
+          # Self-installed approver is runnable and re-approves on its own
+          sudo /usr/local/bin/pinroutes-approve --approve 10.9.0.0/24 10.9.0.1
+          grep -qxF '10.9.0.0/24 10.9.0.1' /etc/pinroutes/routes.allow
+          ! grep -q '10.0.0.0/24' /etc/pinroutes/routes.allow
+          # Enforcement: unapproved routes denied before ip runs
+          h=/usr/local/bin/pinroutes-helper
+          expect 3 sudo "$h" replace 0.0.0.0/0 9.9.9.9
+          expect 3 sudo "$h" replace 0.0.0.0/1 9.9.9.9
+          expect 3 sudo "$h" replace 10.9.0.0/24 6.6.6.6
+          expect 3 sudo "$h" delete 192.168.0.0/16
+          # sudo path without allowlist fails closed
           sudo rm /etc/pinroutes/routes.allow
-          expect 3 replace 10.0.0.0/24 10.0.0.1
+          expect 3 sudo "$h" replace 10.9.0.0/24 10.9.0.1
           # syntax validation independent of policy
-          expect 2 replace "10.0.0.0/16;x" 10.0.0.1
-          echo "enforcement OK"
+          expect 2 sudo "$h" replace "10.0.0.0/16;x" 10.0.0.1
+          # uninstall removes everything
+          sudo /usr/local/bin/pinroutes-approve --uninstall
+          ! test -e /usr/local/bin/pinroutes-helper
+          ! test -e /usr/local/bin/pinroutes-approve
+          ! test -e /etc/sudoers.d/pinroutes
+          echo "privileged flow OK"
