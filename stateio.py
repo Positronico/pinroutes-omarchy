@@ -90,7 +90,10 @@ def main() -> int:
                 except FileNotFoundError:
                     return 0
                 with os.fdopen(fd, "r") as f:
-                    sys.stdout.write(f.read(LIMIT))
+                    content = f.read(LIMIT + 1)
+                if len(content) > LIMIT:
+                    raise Refused(f"state file exceeds limit: {name}")
+                sys.stdout.write(content)
             finally:
                 os.close(dirfd)
             return 0

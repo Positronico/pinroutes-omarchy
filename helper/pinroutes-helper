@@ -11,13 +11,14 @@
 #      sudoers path from being usable by arbitrary same-user processes to
 #      hijack the default route (or any other unapproved route).
 #
-# Without the allowlist and outside sudo (the pkexec per-operation path, where
-# every invocation is individually authenticated by the user), syntax-only
-# validation applies.
+# Without the allowlist and outside sudo (a user running the checkout copy
+# by hand), syntax-only validation applies.
 #
 # NOTE: pinroutes-helper-install embeds a copy of this script — keep in sync.
 #
-# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)...
+# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr> <gateway>)...
+#
+# managed-by: pinroutes
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -54,16 +55,7 @@ allowed_pair() {
   grep -qxF -- "$1 $2" "$ALLOW"
 }
 
-allowed_net() {
-  local n g
-  [[ -f $ALLOW ]] || return 1
-  while read -r n g; do
-    [[ $n == "$1" ]] && return 0
-  done <"$ALLOW"
-  return 1
-}
-
-(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)..."
+(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr> <gateway>)..."
 
 ops=0
 status=0
@@ -81,17 +73,18 @@ while (($#)); do
     if ((enforce)); then
       allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    ip route replace "$net" via "$gw" || status=1
+    timeout -k 2 10 ip route replace "$net" via "$gw" || status=1
     ;;
   delete)
-    (($# >= 1)) || die "delete needs <cidr>"
-    net=$1
-    shift
+    (($# >= 2)) || die "delete needs <cidr> <gateway>"
+    net=$1 gw=$2
+    shift 2
     valid_cidr "$net" || die "invalid network: $net"
+    valid_ip "$gw" || die "invalid gateway: $gw"
     if ((enforce)); then
-      allowed_net "$net" || deny "$net"
+      allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    ip route del "$net" 2>/dev/null || true
+    timeout -k 2 10 ip route del "$net" via "$gw" 2>/dev/null || true
     ;;
   *)
     die "unknown action: $action"

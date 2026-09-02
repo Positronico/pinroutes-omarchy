@@ -1,27 +1,32 @@
 #!/bin/bash
 # PinRoutes privileged installer / route approver.
 #
-# Trust model: root must never execute a file from the user-writable plugin
-# checkout. On the FIRST approval the shell passes this script's text — read
-# into shell memory at plugin load — as an argv constant to the fixed system
-# interpreter (`pkexec /bin/bash -c <text> pinroutes-approve --approve ...`),
-# and this script then installs ITSELF root-owned to
-# /usr/local/bin/pinroutes-approve (recovering its own text from
-# $BASH_EXECUTION_STRING, which bash sets to the -c command string). Every
-# later approval runs that fixed, root-owned copy directly; nothing under the
-# user's home is opened by root again.
+# Trust model: the PLUGIN never initiates execution of this file. First-time
+# installation is a manual step — the panel only copies the exact command to
+# the clipboard and the user runs it in their own terminal:
+#
+#   sudo <plugin-dir>/helper/pinroutes-helper-install --approve <pairs...>
+#
+# That run installs this script root-owned to /usr/local/bin/pinroutes-approve
+# and every later approval or uninstall the plugin performs executes only that
+# fixed, root-owned component via pkexec, passing nothing but validated route
+# pairs as data. Executable content crosses the privilege boundary exactly
+# once, in a command the user typed themselves.
+#
+# The transaction is staged and validated before anything is published:
+# every pre-existing target must be a root-owned regular file carrying the
+# "managed-by: pinroutes" marker (unknown files are refused, never
+# clobbered), staged files are syntax-/visudo-validated first, publication
+# is per-file atomic rename with the sudoers grant last, and uninstall
+# removes only marker-verified files.
 #
 #   pinroutes-approve --approve [<cidr> <gateway>]...
-#       Installs the route helper (embedded below), writes the root-owned
-#       allowlist with exactly the given route pairs, installs this approver
-#       root-owned, and grants the invoking user a NOPASSWD sudoers entry
-#       scoped to the installed helper with a pinned secure_path. The
-#       invoking user is taken from PKEXEC_UID (set by pkexec) or SUDO_UID —
-#       never from arguments or ambient environment strings.
-#
 #   pinroutes-approve --uninstall
-#       Removes the helper, the approver, the sudoers entry, and the
-#       allowlist.
+#
+# The invoking user is taken from PKEXEC_UID (set by pkexec) or SUDO_UID —
+# never from arguments or ambient environment strings.
+#
+# managed-by: pinroutes
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -30,14 +35,29 @@ APPROVE_DEST=/usr/local/bin/pinroutes-approve
 SUDOERS=/etc/sudoers.d/pinroutes
 ALLOW_DIR=/etc/pinroutes
 ALLOW=$ALLOW_DIR/routes.allow
+MARKER='managed-by: pinroutes'
 MAX_ROUTES=100
 
 die() { echo "pinroutes-approve: $*" >&2; exit 2; }
 
-((EUID == 0)) || die "must run as root (via pkexec)"
+((EUID == 0)) || die "must run as root (via sudo or pkexec)"
 
-# Own source text: from the -c command string when bootstrapping, from the
-# root-owned installed path afterwards. Never from a user-writable file.
+# A target may be replaced or removed only when it is absent or provably
+# ours: a root-owned regular file (not a symlink) carrying the marker.
+target_ok() {
+  local path=$1
+  [[ -e $path || -L $path ]] || return 0
+  [[ -f $path && ! -L $path ]] || return 1
+  [[ $(stat -c %u -- "$path") == 0 ]] || return 1
+  grep -qF -- "$MARKER" "$path" 2>/dev/null
+}
+
+require_target() {
+  target_ok "$1" || die "refusing to touch $1: existing file is not managed by pinroutes"
+}
+
+# Own source text: from the -c command string when invoked as
+# `bash -c "$(cat ...)"`, from $0 otherwise.
 self_source() {
   if [[ -n ${BASH_EXECUTION_STRING:-} ]]; then
     local text=$BASH_EXECUTION_STRING
@@ -49,9 +69,14 @@ self_source() {
 }
 
 if [[ ${1:-} == "--uninstall" ]]; then
-  rm -f "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"
+  for f in "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"; do
+    if [[ -e $f || -L $f ]]; then
+      require_target "$f"
+      rm -f -- "$f"
+      echo "removed $f"
+    fi
+  done
   rmdir "$ALLOW_DIR" 2>/dev/null || true
-  echo "removed $HELPER_DEST, $APPROVE_DEST, $SUDOERS and $ALLOW"
   exit 0
 fi
 
@@ -93,10 +118,36 @@ while (($#)); do
   pairs+=("$net $gw")
 done
 
-# ---- embedded helper (keep in sync with helper/pinroutes-helper) -----------
-helper_tmp=$(mktemp)
-approve_tmp=$(mktemp)
-trap 'rm -f "$helper_tmp" "$approve_tmp"' EXIT
+# ---- refuse unknown targets up front ---------------------------------------
+require_target "$HELPER_DEST"
+require_target "$APPROVE_DEST"
+require_target "$SUDOERS"
+require_target "$ALLOW"
+if [[ -e $ALLOW_DIR || -L $ALLOW_DIR ]]; then
+  [[ -d $ALLOW_DIR && ! -L $ALLOW_DIR && $(stat -c %u -- "$ALLOW_DIR") == 0 ]] \
+    || die "refusing to use $ALLOW_DIR: not a root-owned directory"
+fi
+
+# ---- stage the complete transaction ----------------------------------------
+# Each staged file lives in its target's directory so publication is an
+# atomic same-filesystem rename.
+staged=()
+cleanup() { rm -f -- "${staged[@]:-}"; }
+trap cleanup EXIT
+
+stage() { # stage <dir> -> prints tmp path
+  local tmp
+  tmp=$(mktemp -- "$1/.pinroutes-stage.XXXXXX")
+  staged+=("$tmp")
+  printf '%s' "$tmp"
+}
+
+install -d -o root -g root -m 0755 "$ALLOW_DIR"
+# sudoers.d is a shared system directory: create it only if absent, never
+# rewrite an existing one's mode or ownership.
+[[ -d $(dirname "$SUDOERS") ]] || install -d -o root -g root -m 0750 "$(dirname "$SUDOERS")"
+
+helper_tmp=$(stage /usr/local/bin)
 cat >"$helper_tmp" <<'EMBEDDED_HELPER'
 #!/bin/bash
 # PinRoutes privileged helper: the only thing it knows how to do is add or
@@ -111,13 +162,14 @@ cat >"$helper_tmp" <<'EMBEDDED_HELPER'
 #      sudoers path from being usable by arbitrary same-user processes to
 #      hijack the default route (or any other unapproved route).
 #
-# Without the allowlist and outside sudo (the pkexec per-operation path, where
-# every invocation is individually authenticated by the user), syntax-only
-# validation applies.
+# Without the allowlist and outside sudo (a user running the checkout copy
+# by hand), syntax-only validation applies.
 #
 # NOTE: pinroutes-helper-install embeds a copy of this script — keep in sync.
 #
-# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)...
+# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr> <gateway>)...
+#
+# managed-by: pinroutes
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -154,16 +206,7 @@ allowed_pair() {
   grep -qxF -- "$1 $2" "$ALLOW"
 }
 
-allowed_net() {
-  local n g
-  [[ -f $ALLOW ]] || return 1
-  while read -r n g; do
-    [[ $n == "$1" ]] && return 0
-  done <"$ALLOW"
-  return 1
-}
-
-(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)..."
+(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr> <gateway>)..."
 
 ops=0
 status=0
@@ -181,17 +224,18 @@ while (($#)); do
     if ((enforce)); then
       allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    ip route replace "$net" via "$gw" || status=1
+    timeout -k 2 10 ip route replace "$net" via "$gw" || status=1
     ;;
   delete)
-    (($# >= 1)) || die "delete needs <cidr>"
-    net=$1
-    shift
+    (($# >= 2)) || die "delete needs <cidr> <gateway>"
+    net=$1 gw=$2
+    shift 2
     valid_cidr "$net" || die "invalid network: $net"
+    valid_ip "$gw" || die "invalid gateway: $gw"
     if ((enforce)); then
-      allowed_net "$net" || deny "$net"
+      allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    ip route del "$net" 2>/dev/null || true
+    timeout -k 2 10 ip route del "$net" via "$gw" 2>/dev/null || true
     ;;
   *)
     die "unknown action: $action"
@@ -200,30 +244,39 @@ while (($#)); do
 done
 exit $status
 EMBEDDED_HELPER
-# ---------------------------------------------------------------------------
 
-install -o root -g root -m 0755 "$helper_tmp" "$HELPER_DEST"
-
+approve_tmp=$(stage /usr/local/bin)
 self_source >"$approve_tmp"
-install -o root -g root -m 0755 "$approve_tmp" "$APPROVE_DEST"
 
-install -d -o root -g root -m 0755 "$ALLOW_DIR"
-allow_tmp=$(mktemp)
-printf '%s\n' "${pairs[@]:-}" | sed '/^$/d' >"$allow_tmp"
-install -o root -g root -m 0644 "$allow_tmp" "$ALLOW"
-rm -f "$allow_tmp"
-
-install -d -o root -g root -m 0750 "$(dirname "$SUDOERS")"
-sudoers_tmp=$(mktemp)
+allow_tmp=$(stage "$ALLOW_DIR")
 {
+  printf '# %s\n' "$MARKER"
+  printf '%s\n' "${pairs[@]:-}" | sed '/^$/d'
+} >"$allow_tmp"
+
+sudoers_tmp=$(stage "$(dirname "$SUDOERS")")
+{
+  printf '# %s\n' "$MARKER"
   printf 'Defaults!%s secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\n' "$HELPER_DEST"
   printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_DEST"
 } >"$sudoers_tmp"
-if ! visudo -cf "$sudoers_tmp" >/dev/null; then
-  rm -f "$sudoers_tmp"
-  die "generated sudoers entry failed validation"
-fi
-install -o root -g root -m 0440 "$sudoers_tmp" "$SUDOERS"
-rm -f "$sudoers_tmp"
+
+# ---- validate everything before publishing anything ------------------------
+bash -n "$helper_tmp" || die "staged helper failed syntax validation"
+bash -n "$approve_tmp" || die "staged approver failed syntax validation"
+grep -qF -- "$MARKER" "$helper_tmp" || die "staged helper missing marker"
+grep -qF -- "$MARKER" "$approve_tmp" || die "staged approver missing marker"
+visudo -cf "$sudoers_tmp" >/dev/null || die "staged sudoers entry failed validation"
+
+# ---- publish: atomic renames, privilege grant (sudoers) last ---------------
+chown root:root -- "$helper_tmp" "$approve_tmp" "$allow_tmp" "$sudoers_tmp"
+chmod 0755 -- "$helper_tmp" "$approve_tmp"
+chmod 0644 -- "$allow_tmp"
+chmod 0440 -- "$sudoers_tmp"
+mv -fT -- "$helper_tmp" "$HELPER_DEST"
+mv -fT -- "$approve_tmp" "$APPROVE_DEST"
+mv -fT -- "$allow_tmp" "$ALLOW"
+mv -fT -- "$sudoers_tmp" "$SUDOERS"
+staged=()
 
 echo "installed $HELPER_DEST and $APPROVE_DEST; approved ${#pairs[@]} route(s) for $user"

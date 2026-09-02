@@ -408,7 +408,7 @@ Panel {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: pin.installHelper()
+                onClicked: pin.copyInstallCommand()
               }
 
               RowLayout {
@@ -434,7 +434,7 @@ Panel {
 
                   Text {
                     Layout.fillWidth: true
-                    text: "Install helper"
+                    text: "Install helper — copy terminal command"
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -443,7 +443,7 @@ Panel {
 
                   Text {
                     Layout.fillWidth: true
-                    text: "One password prompt approves your routes for silent re-apply"
+                    text: "Click to copy, then run it once in a terminal. It installs the helper and approves your routes for silent re-apply."
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption

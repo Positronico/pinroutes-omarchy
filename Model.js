@@ -83,12 +83,19 @@ function dstKey(normalizedCidr) {
   return String(normalizedCidr)
 }
 
+// The same bounds the state loader enforces (sanitizeRoutes) apply at every
+// creation/update boundary, so the live model can never outgrow them.
+var MAX_ROUTES = 100
+var MAX_NAME = 100
+
 function validateRule(name, network, gateway) {
-  if (String(name || "").trim() === "") return { ok: false, error: "Name is required" }
+  var trimmed = String(name || "").trim()
+  if (trimmed === "") return { ok: false, error: "Name is required" }
+  if (trimmed.length > MAX_NAME) return { ok: false, error: "Name too long (max " + MAX_NAME + " characters)" }
   var normalized = normalizeCidr(network)
   if (!normalized) return { ok: false, error: "Network must be IPv4 CIDR, e.g. 10.255.0.0/16" }
   if (!isIPv4(gateway)) return { ok: false, error: "Gateway must be an IPv4 address, e.g. 10.0.0.1" }
-  return { ok: true, name: String(name).trim(), network: normalized, gateway: String(gateway).trim() }
+  return { ok: true, name: trimmed, network: normalized, gateway: String(gateway).trim() }
 }
 
 function makeId() {
@@ -129,10 +136,10 @@ function verifyStatuses(routes, tableEntries) {
 function sanitizeRoutes(raw) {
   var out = []
   if (!(raw instanceof Array)) return out
-  for (var i = 0; i < raw.length && out.length < 100; i++) {
+  for (var i = 0; i < raw.length && out.length < MAX_ROUTES; i++) {
     var r = raw[i]
     if (!r || typeof r !== "object") continue
-    var name = String(r.name || "").slice(0, 100)
+    var name = String(r.name || "").slice(0, MAX_NAME)
     var network = normalizeCidr(r.network)
     var gateway = String(r.gateway || "")
     if (name === "" || !network || !isIPv4(gateway)) continue

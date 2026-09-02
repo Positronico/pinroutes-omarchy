@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "pinroutes",
   "name": "PinRoutes",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "Positronico",
   "license": "MIT",
   "description": "Keeps your static routes pinned. Routes get lost after sleep, VPN reconnects, or network changes — PinRoutes watches for that and puts them back.",
