@@ -67,10 +67,13 @@ Item {
   property bool approveToolInstalled: false
 
   // The command the user runs once in a terminal to install and approve.
-  // routes.length is capped at Model.MAX_ROUTES at every boundary (add,
-  // update, restore), so no slicing happens here.
+  // The $(cat …) capture happens in the USER's shell before sudo, so root
+  // receives the script as in-memory text and never opens the user-writable
+  // checkout (the installer refuses direct execution of non-root-owned
+  // files). routes.length is capped at Model.MAX_ROUTES at every boundary
+  // (add, update, restore), so no slicing happens here.
   readonly property string installCommand: {
-    var cmd = "sudo " + Util.shellQuote(installScriptPath) + " --approve"
+    var cmd = "sudo /bin/bash -c \"$(cat " + Util.shellQuote(installScriptPath) + ")\" pinroutes-approve --approve"
     for (var i = 0; i < routes.length; i++) {
       cmd += " " + routes[i].network + " " + routes[i].gateway
     }

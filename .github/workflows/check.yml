@@ -39,21 +39,24 @@ jobs:
       - name: State I/O hardening
         run: |
           set -u
+          # NB: a bare `! cmd` mid-step asserts nothing under bash -e
+          # (errexit exempts !-pipelines); refute() fails the step for real.
+          refute() { if "$@" >/dev/null 2>&1; then echo "FAIL(unexpectedly succeeded): $*"; exit 1; fi; }
           S=$PWD/stateio.py
           cd "$(mktemp -d)"
           mkdir -p cfg
           echo '{"ok":true}' | python3 "$S" write cfg/state.json
           [ "$(python3 "$S" read cfg/state.json)" = '{"ok":true}' ]
           ln -s /etc/hostname cfg/link.json
-          ! python3 "$S" read cfg/link.json 2>/dev/null
+          refute python3 "$S" read cfg/link.json
           mkfifo cfg/fifo.json
           timeout 3 python3 "$S" read cfg/fifo.json 2>/dev/null && exit 1 || [ $? -ne 124 ]
           touch cfg/a.json && ln cfg/a.json cfg/hard.json
-          ! python3 "$S" read cfg/hard.json 2>/dev/null
+          refute python3 "$S" read cfg/hard.json
           head -c 1048577 /dev/zero | python3 "$S" write cfg/state.json 2>/dev/null && exit 1
           [ "$(python3 "$S" read cfg/state.json)" = '{"ok":true}' ]  # over-limit write left old content intact
           head -c 1048577 /dev/zero > cfg/big.json
-          ! python3 "$S" read cfg/big.json 2>/dev/null  # oversized file refused, not truncated
+          refute python3 "$S" read cfg/big.json  # oversized file refused, not truncated
           echo "stateio OK"
 
       - name: Bootstrap, allowlist enforcement, fixed-component re-approve
@@ -66,31 +69,38 @@ jobs:
             "$@" 2>/dev/null || rc=$?
             [ "$rc" -eq "$want" ] || { echo "FAIL($rc!=$want): $*"; exit 1; }
           }
-          # Refusal first: a foreign file at a managed path must block install
-          echo junk | sudo tee /usr/local/bin/pinroutes-helper >/dev/null
+          # `! cmd` mid-step asserts nothing under bash -e; refute() does.
+          refute() { if "$@" >/dev/null 2>&1; then echo "FAIL(unexpectedly succeeded): $*"; exit 1; fi; }
+          bootstrap() { sudo /bin/bash -c "$(cat helper/pinroutes-helper-install)" pinroutes-approve "$@"; }
+          # Direct root execution of the (user-owned) checkout file is refused
           expect 2 sudo ./helper/pinroutes-helper-install --approve 10.0.0.0/24 10.0.0.1
-          expect 2 sudo ./helper/pinroutes-helper-install --uninstall
+          # Refusal: a foreign file at a managed path must block install
+          echo junk | sudo tee /usr/local/bin/pinroutes-helper >/dev/null
+          expect 2 bootstrap --approve 10.0.0.0/24 10.0.0.1
+          expect 2 bootstrap --uninstall
           sudo rm /usr/local/bin/pinroutes-helper
-          # Bootstrap exactly as documented: the user runs the checkout
-          # installer once, by hand, in their own terminal.
-          sudo ./helper/pinroutes-helper-install --approve 10.0.0.0/24 10.0.0.1
+          # Bootstrap exactly as documented: the user's shell captures the
+          # script text; root receives only memory, never the checkout path.
+          bootstrap --approve 10.0.0.0/24 10.0.0.1
           test -x /usr/local/bin/pinroutes-helper
           test -x /usr/local/bin/pinroutes-approve
           diff /usr/local/bin/pinroutes-approve helper/pinroutes-helper-install
           grep -qxF '10.0.0.0/24 10.0.0.1' /etc/pinroutes/routes.allow
           sudo grep -q 'secure_path' /etc/sudoers.d/pinroutes
           sudo grep -q 'managed-by: pinroutes' /etc/sudoers.d/pinroutes
+          sudo grep -Eq '^#[0-9]+ ALL=\(root\) NOPASSWD:' /etc/sudoers.d/pinroutes
           sudo visudo -cf /etc/sudoers.d/pinroutes
+          sudo test ! -e /etc/pinroutes/.pinroutes-txn  # journal committed away
           # No staging leftovers
-          ! ls /usr/local/bin/.pinroutes-stage.* 2>/dev/null
+          refute ls /usr/local/bin/.pinroutes-stage.*
           # Self-installed approver is runnable and re-approves on its own
           # (update-in-place exercises the backup/publish path)
           sudo /usr/local/bin/pinroutes-approve --approve 10.9.0.0/24 10.9.0.1
           grep -qxF '10.9.0.0/24 10.9.0.1' /etc/pinroutes/routes.allow
-          ! grep -q '10.0.0.0/24' /etc/pinroutes/routes.allow
+          refute grep -q '10.0.0.0/24' /etc/pinroutes/routes.allow
           for d in /usr/local/bin /etc/pinroutes /etc/sudoers.d; do
-            ! ls "$d"/.*.pinroutes-prev.* 2>/dev/null
-            ! ls "$d"/.pinroutes-stage.* 2>/dev/null
+            refute ls "$d"/.*.pinroutes-prev.*
+            refute ls "$d"/.pinroutes-stage.*
           done
           # Enforcement: unapproved routes denied before ip runs
           h=/usr/local/bin/pinroutes-helper
@@ -106,7 +116,7 @@ jobs:
           expect 2 sudo "$h" replace "10.0.0.0/16;x" 10.0.0.1
           # uninstall removes everything
           sudo /usr/local/bin/pinroutes-approve --uninstall
-          ! test -e /usr/local/bin/pinroutes-helper
-          ! test -e /usr/local/bin/pinroutes-approve
-          ! test -e /etc/sudoers.d/pinroutes
+          test ! -e /usr/local/bin/pinroutes-helper
+          test ! -e /usr/local/bin/pinroutes-approve
+          test ! -e /etc/sudoers.d/pinroutes
           echo "privileged flow OK"

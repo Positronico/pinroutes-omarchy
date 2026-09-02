@@ -1,17 +1,21 @@
 #!/bin/bash
 # PinRoutes privileged installer / route approver.
 #
-# Trust model: the PLUGIN never initiates execution of this file. First-time
-# installation is a manual step — the panel only copies the exact command to
-# the clipboard and the user runs it in their own terminal:
+# Trust model: the PLUGIN never initiates execution of this file, and root
+# never opens it. First-time installation is a manual step — the panel only
+# copies the exact command to the clipboard and the user runs it in their
+# own terminal:
 #
-#   sudo <plugin-dir>/helper/pinroutes-helper-install --approve <pairs...>
+#   sudo /bin/bash -c "$(cat '<plugin-dir>/helper/pinroutes-helper-install')" \
+#     pinroutes-approve --approve <pairs...>
 #
-# That run installs this script root-owned to /usr/local/bin/pinroutes-approve
-# and every later approval or uninstall the plugin performs executes only that
-# fixed, root-owned component via pkexec, passing nothing but validated route
-# pairs as data. Executable content crosses the privilege boundary exactly
-# once, in a command the user typed themselves.
+# The $(cat …) runs in the USER's shell before any privilege exists, so the
+# content root executes is bound at that moment; direct root execution of a
+# non-root-owned file is refused below. The run installs this script (from
+# that same in-memory text) root-owned to /usr/local/bin/pinroutes-approve,
+# and every later approval or uninstall the plugin performs executes only
+# that fixed, root-owned component via pkexec, passing nothing but validated
+# route pairs as data.
 #
 # The transaction is staged and validated before anything is published:
 # every pre-existing target must be a root-owned regular file carrying the
@@ -33,10 +37,31 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # Whole-invocation deadline, enforced in the privileged context itself:
 # re-exec once under timeout(1) (TERM after 60s, KILL 5s later) so the total
 # runtime is bounded root-side regardless of what the unprivileged caller
-# does. Skipped only when $0 is not a real executable (bash -c invocation).
-if [[ -z ${PINROUTES_DEADLINE:-} && -x $0 ]]; then
+# does. The re-exec NEVER reopens a user-writable path: in memory mode
+# (bash -c) the script text travels via $BASH_EXECUTION_STRING, and in file
+# mode only a root-owned $0 (the installed copy) is re-executed. Direct
+# execution of a non-root-owned file is refused further below.
+# Memory mode is genuine only when bash itself is executing a -c string:
+# BASH_EXECUTION_STRING is then set by bash AND BASH_SOURCE is empty. An
+# *exported* BASH_EXECUTION_STRING forged by an env-forwarding caller would
+# survive into a script-mode bash, but cannot blank BASH_SOURCE (arrays do
+# not import from the environment).
+memory_mode=0
+if [[ -n ${BASH_EXECUTION_STRING:-} && -z ${BASH_SOURCE[0]:-} ]]; then
+  memory_mode=1
+fi
+
+if [[ -z ${PINROUTES_DEADLINE:-} ]]; then
   export PINROUTES_DEADLINE=1
-  exec timeout -k 5 60 "$0" "$@"
+  if ((memory_mode)); then
+    exec timeout -k 5 60 /bin/bash -c "$BASH_EXECUTION_STRING" "$0" "$@"
+  elif [[ -f $0 && ! -L $0 && $(stat -c %u -- "$0" 2>/dev/null) == 0 ]]; then
+    # Residual: the ownership stat and the exec are separate path
+    # resolutions; swapping between them requires write access to a
+    # directory that already contained a root-owned executable the caller
+    # chose to run, which confers no new capability.
+    exec timeout -k 5 60 "$0" "$@"
+  fi
 fi
 
 HELPER_DEST=/usr/local/bin/pinroutes-helper
@@ -44,6 +69,7 @@ APPROVE_DEST=/usr/local/bin/pinroutes-approve
 SUDOERS=/etc/sudoers.d/pinroutes
 ALLOW_DIR=/etc/pinroutes
 ALLOW=$ALLOW_DIR/routes.allow
+JOURNAL=$ALLOW_DIR/.pinroutes-txn
 MARKER='managed-by: pinroutes'
 MAX_ROUTES=100
 
@@ -51,14 +77,61 @@ die() { echo "pinroutes-approve: $*" >&2; exit 2; }
 
 ((EUID == 0)) || die "must run as root (via sudo or pkexec)"
 
+# Root only ever reads this script's code from memory (the bash -c capture,
+# where the USER's own shell read the file before any privilege existed) or
+# from a root-owned installed file. Direct execution of a user-writable path
+# would let a same-user process swap the content between the user's review
+# and root's reopen, so it is refused with the safe invocation instead.
+if ((! memory_mode)); then
+  [[ -f $0 && ! -L $0 && $(stat -c %u -- "$0" 2>/dev/null) == 0 ]] \
+    || die "refusing to execute a non-root-owned file as root; run instead: sudo /bin/bash -c \"\$(cat '<path-to>/pinroutes-helper-install')\" pinroutes-approve --approve <pairs...>"
+fi
+
 # One installer at a time: concurrent runs could interleave publish/rollback.
 # The lock rides a read fd on the managed directory itself — no extra file.
 exec 9</usr/local/bin
 flock -n 9 || die "another pinroutes install/approve is already running"
 
-# Remove crash leftovers from any earlier SIGKILLed run (the EXIT trap covers
-# everything short of SIGKILL). Only files matching our own staging/backup
-# naming in the managed directories are touched.
+# Crash recovery. A durable journal (written and fsynced before the first
+# live rename, removed after the last) lists every target with its backup.
+# If a previous run died mid-publication (SIGKILL, power loss), the journal
+# survives and the next run FIRST restores the recorded pre-transaction
+# state — only then are leftover staging/backup files swept. A backup file
+# without a journal means the transaction committed (or never started), so
+# sweeping it is correct.
+recover_interrupted() {
+  [[ -e $JOURNAL || -L $JOURNAL ]] || return 0
+  # The journal is a root file-operation directive: act on it only when the
+  # directory and the journal itself are exactly what this installer writes
+  # (root-owned, non-symlink, dir not group/other-writable), and only for
+  # the four fixed targets with correctly-named backups. Anything else is
+  # discarded, not obeyed.
+  if ! [[ -d $ALLOW_DIR && ! -L $ALLOW_DIR && $(stat -c %u -- "$ALLOW_DIR") == 0 ]] \
+    || (($(stat -c '8#%a' -- "$ALLOW_DIR") & 8#022)) \
+    || ! [[ -f $JOURNAL && ! -L $JOURNAL && $(stat -c %u -- "$JOURNAL") == 0 ]]; then
+    rm -f -- "$JOURNAL" 2>/dev/null || true
+    return 0
+  fi
+  echo "recovering interrupted pinroutes transaction" >&2
+  local target backup expected
+  while IFS='|' read -r target backup; do
+    case $target in
+    "$HELPER_DEST" | "$APPROVE_DEST" | "$ALLOW" | "$SUDOERS") ;;
+    *) continue ;;
+    esac
+    expected="$(dirname -- "$target")/.$(basename -- "$target").pinroutes-prev."
+    if [[ $backup == "$expected"* && -f $backup && ! -L $backup ]]; then
+      mv -fT -- "$backup" "$target" 2>/dev/null || true
+    elif [[ $backup == "-" ]]; then
+      rm -f -- "$target" || true
+    fi
+  done <"$JOURNAL"
+  rm -f -- "$JOURNAL"
+  sync "$ALLOW_DIR" 2>/dev/null || true
+}
+
+# Remove crash leftovers matching our own staging/backup naming in the
+# managed directories. Runs only after recover_interrupted.
 sweep_leftovers() {
   local d
   for d in /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")"; do
@@ -81,10 +154,10 @@ require_target() {
   target_ok "$1" || die "refusing to touch $1: existing file is not managed by pinroutes"
 }
 
-# Own source text: from the -c command string when invoked as
-# `bash -c "$(cat ...)"`, from $0 otherwise.
+# Own source text: from the -c command string in genuine memory mode, from
+# the (root-owned, verified above) $0 otherwise.
 self_source() {
-  if [[ -n ${BASH_EXECUTION_STRING:-} ]]; then
+  if ((memory_mode)); then
     local text=$BASH_EXECUTION_STRING
     [[ $text == '#!'* ]] || text=$'#!/bin/bash\n'$text
     printf '%s\n' "${text%$'\n'}"
@@ -94,6 +167,7 @@ self_source() {
 }
 
 if [[ ${1:-} == "--uninstall" ]]; then
+  recover_interrupted
   for f in "$HELPER_DEST" "$APPROVE_DEST" "$SUDOERS" "$ALLOW"; do
     if [[ -e $f || -L $f ]]; then
       require_target "$f"
@@ -144,7 +218,8 @@ while (($#)); do
   pairs+=("$net $gw")
 done
 
-# ---- refuse unknown targets up front ---------------------------------------
+# ---- recover any interrupted transaction, then refuse unknown targets ------
+recover_interrupted
 require_target "$HELPER_DEST"
 require_target "$APPROVE_DEST"
 require_target "$SUDOERS"
@@ -175,7 +250,7 @@ stage_into() { # stage_into <varname> <dir>
   printf -v "$1" '%s' "$tmp"
 }
 
-backup_target() { # backup_target <target>
+backup_target() { # backup_target <target> — taken for every existing target
   [[ -e $1 ]] || return 0
   local bak
   bak=$(dirname -- "$1")/.$(basename -- "$1").pinroutes-prev.$$
@@ -183,16 +258,20 @@ backup_target() { # backup_target <target>
   backups+=("$bak|$1")
 }
 
-publish() { # publish <staged> <target>
-  backup_target "$2"
+publish() { # publish <staged> <target> — backups were all taken up front
   mv -fT -- "$1" "$2"
   published+=("$2")
 }
 
 rollback() {
-  local i t entry backup target restored
+  local i t entry backup target restored seen=" "
   for ((i = ${#published[@]} - 1; i >= 0; i--)); do
     t=${published[i]}
+    # A target can appear twice (sudoers: revoke, then new publish) — only
+    # the most recent action per target is undone, or the restored backup
+    # would be deleted again by the earlier entry.
+    [[ $seen == *" $t "* ]] && continue
+    seen="$seen$t "
     restored=0
     for entry in ${backups[@]+"${backups[@]}"}; do
       backup=${entry%%|*} target=${entry#*|}
@@ -207,7 +286,10 @@ rollback() {
 }
 
 cleanup() {
-  if ((failed)); then rollback; fi
+  if ((failed)); then
+    rollback
+    rm -f -- "$JOURNAL" || true
+  fi
   local f entry
   for f in ${staged[@]+"${staged[@]}"}; do rm -f -- "$f" || true; done
   for entry in ${backups[@]+"${backups[@]}"}; do rm -f -- "${entry%%|*}" || true; done
@@ -252,8 +334,10 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # Whole-invocation deadline, enforced in the privileged context itself:
 # re-exec once under timeout(1) (TERM after 60s, KILL 5s later) so the total
 # runtime is bounded root-side regardless of what the unprivileged caller
-# does. Skipped only when $0 is not a real executable (bash -c invocation).
-if [[ -z ${PINROUTES_DEADLINE:-} && -x $0 ]]; then
+# does. The re-exec never reopens a user-writable path: it only happens when
+# $0 is a root-owned regular file (the installed copy).
+if [[ -z ${PINROUTES_DEADLINE:-} && -f $0 && ! -L $0 ]] \
+  && [[ $(stat -c %u -- "$0" 2>/dev/null) == 0 ]]; then
   export PINROUTES_DEADLINE=1
   exec timeout -k 5 60 "$0" "$@"
 fi
@@ -342,8 +426,12 @@ stage_into allow_tmp "$ALLOW_DIR"
 stage_into sudoers_tmp "$(dirname "$SUDOERS")"
 {
   printf '# %s\n' "$MARKER"
+  printf '# grants uid %s (%s)\n' "$uid" "$user"
   printf 'Defaults!%s secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\n' "$HELPER_DEST"
-  printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_DEST"
+  # The numeric #uid User_List form: account NAMES are attacker-choosable
+  # policy tokens (a local user literally named "ALL" would change the rule
+  # subject), a validated numeric uid is not.
+  printf '#%s ALL=(root) NOPASSWD: %s\n' "$uid" "$HELPER_DEST"
 } >"$sudoers_tmp"
 
 # ---- validate everything before publishing anything ------------------------
@@ -353,15 +441,55 @@ grep -qF -- "$MARKER" "$helper_tmp" || die "staged helper missing marker"
 grep -qF -- "$MARKER" "$approve_tmp" || die "staged approver missing marker"
 visudo -cf "$sudoers_tmp" >/dev/null || die "staged sudoers entry failed validation"
 
-# ---- publish: atomic renames with rollback, privilege grant last -----------
+# ---- publish: journaled, revoke-first, atomic renames, grant last ----------
 chown root:root -- "$helper_tmp" "$approve_tmp" "$allow_tmp" "$sudoers_tmp"
 chmod 0755 -- "$helper_tmp" "$approve_tmp"
 chmod 0644 -- "$allow_tmp"
 chmod 0440 -- "$sudoers_tmp"
+
+# Back up every existing target, then write the durable journal (fsynced,
+# alongside the backups) BEFORE the first live rename: an interruption at
+# any later point — including SIGKILL or power loss — is recovered by the
+# next run from the journal, never swept away.
+backup_target "$HELPER_DEST"
+backup_target "$APPROVE_DEST"
+backup_target "$ALLOW"
+backup_target "$SUDOERS"
+
+journal_for() { # journal_for <target> -> "target|backup" or "target|-"
+  local entry
+  for entry in ${backups[@]+"${backups[@]}"}; do
+    if [[ ${entry#*|} == "$1" ]]; then
+      printf '%s|%s\n' "$1" "${entry%%|*}"
+      return 0
+    fi
+  done
+  printf '%s|-\n' "$1"
+}
+{
+  journal_for "$HELPER_DEST"
+  journal_for "$APPROVE_DEST"
+  journal_for "$ALLOW"
+  journal_for "$SUDOERS"
+} >"$JOURNAL"
+sync "$JOURNAL" ${backups[@]+"${backups[@]%%|*}"} "$ALLOW_DIR" /usr/local/bin "$(dirname "$SUDOERS")" 2>/dev/null || true
+
+# Revoke first on update: the old grant must never remain active over a
+# half-replaced installation. Rollback/recovery restores it from backup.
+if [[ -e $SUDOERS ]]; then
+  rm -f -- "$SUDOERS"
+  published+=("$SUDOERS")
+fi
+
 publish "$helper_tmp" "$HELPER_DEST"
 publish "$approve_tmp" "$APPROVE_DEST"
 publish "$allow_tmp" "$ALLOW"
 publish "$sudoers_tmp" "$SUDOERS"
+sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || true
+
+# Commit: drop the journal, then (via cleanup) the backups.
+rm -f -- "$JOURNAL"
+sync "$ALLOW_DIR" 2>/dev/null || true
 failed=0
 
 echo "installed $HELPER_DEST and $APPROVE_DEST; approved ${#pairs[@]} route(s) for $user"
