@@ -36,6 +36,45 @@ function normalizeCidr(str) {
   return o.join(".") + "/" + parsed.prefix
 }
 
+function ipToInt(str) {
+  var m = String(str || "").match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return -1
+  return ((parseInt(m[1], 10) * 16777216) + (parseInt(m[2], 10) * 65536)
+        + (parseInt(m[3], 10) * 256) + parseInt(m[4], 10)) >>> 0
+}
+
+// Does a route-table dst ("default", "10.9.9.9", "10.255.10.0/24") cover ip?
+function dstContains(dst, ip) {
+  var cidr = String(dst || "")
+  if (cidr === "default") cidr = "0.0.0.0/0"
+  if (cidr.indexOf("/") === -1) cidr = cidr + "/32"
+  var parsed = parseCidr(cidr)
+  var addr = ipToInt(ip)
+  if (!parsed || addr < 0) return false
+  var base = ((parsed.octets[0] * 16777216) + (parsed.octets[1] * 65536)
+            + (parsed.octets[2] * 256) + parsed.octets[3]) >>> 0
+  var mask = parsed.prefix === 0 ? 0 : (0xFFFFFFFF << (32 - parsed.prefix)) >>> 0
+  return ((addr & mask) >>> 0) === ((base & mask) >>> 0)
+}
+
+// Mirrors the kernel's nexthop validation: `ip route replace X via GW` only
+// succeeds when GW resolves through a directly-connected route — an entry
+// with no gateway of its own (link-scope subnet, host route, or a dev-only
+// default as point-to-point VPNs install). When this is false the gateway is
+// off-net (wifi still reassociating, foreign network, VPN tunnel down) and
+// applying would fail with "Nexthop has invalid gateway".
+function isGatewayOnLink(gateway, tableEntries) {
+  var entries = tableEntries instanceof Array ? tableEntries : []
+  if (!isIPv4(gateway)) return false
+  for (var i = 0; i < entries.length; i++) {
+    var e = entries[i]
+    if (!e || typeof e.dst !== "string") continue
+    if (e.gateway !== undefined && e.gateway !== null && String(e.gateway) !== "") continue
+    if (dstContains(e.dst, gateway)) return true
+  }
+  return false
+}
+
 // `ip -j route show` prints a /32 destination as the bare address.
 function dstKey(normalizedCidr) {
   var parsed = parseCidr(normalizedCidr)
@@ -56,10 +95,12 @@ function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10)
 }
 
-// Build id -> "active" | "missing" | "disabled" from the parsed route table.
-// A rule is active when any main-table entry has its exact destination and
-// gateway; anything else (absent, or same dst through another gateway) is
-// missing, matching the macOS verifyRoute semantics.
+// Build id -> "active" | "missing" | "standby" | "disabled" from the parsed
+// route table. A rule is active when any main-table entry has its exact
+// destination and gateway. When the rule's gateway is not on-link the rule is
+// in standby: applying is impossible on this network (the kernel would refuse
+// the nexthop), so it is neither a problem to alert on nor a route to fix —
+// the netlink monitor flips it back the moment the gateway's subnet returns.
 function verifyStatuses(routes, tableEntries) {
   var entries = tableEntries instanceof Array ? tableEntries : []
   var statuses = {}
@@ -78,7 +119,8 @@ function verifyStatuses(routes, tableEntries) {
         break
       }
     }
-    statuses[rule.id] = found ? "active" : "missing"
+    if (found) statuses[rule.id] = "active"
+    else statuses[rule.id] = isGatewayOnLink(rule.gateway, entries) ? "missing" : "standby"
   }
   return statuses
 }

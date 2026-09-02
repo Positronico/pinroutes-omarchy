@@ -38,6 +38,7 @@ Panel {
   function statusLabel(status) {
     if (status === "active") return "pinned"
     if (status === "missing") return "missing"
+    if (status === "standby") return "standby — gateway unreachable"
     if (status === "disabled") return "disabled"
     return "checking"
   }
@@ -528,9 +529,12 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: routeRow.rule
-            ? routeRow.rule.network + " via " + routeRow.rule.gateway + " · " + root.statusLabel(routeRow.status)
-            : ""
+          // Standby drops the "via <gw>" so the reason survives eliding.
+          text: {
+            if (!routeRow.rule) return ""
+            if (routeRow.status === "standby") return routeRow.rule.network + " · gateway unreachable"
+            return routeRow.rule.network + " via " + routeRow.rule.gateway + " · " + root.statusLabel(routeRow.status)
+          }
           color: routeRow.status === "missing" ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -541,7 +545,7 @@ Panel {
       PanelActionButton {
         iconText: "󰑐"
         tooltipText: "Re-apply now"
-        visible: routeRow.status !== "disabled"
+        visible: routeRow.status !== "disabled" && routeRow.status !== "standby"
         foreground: root.foreground
         fontFamily: root.fontFamily
         Layout.alignment: Qt.AlignVCenter

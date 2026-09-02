@@ -11,8 +11,9 @@ This is the Linux/Omarchy port of the [PinRoutes macOS menu bar app](https://git
 - **Bar widget** — a pin icon in the Omarchy bar; it turns urgent when a route goes missing
 - **Route management** — add, edit, enable/disable routes with CIDR network + gateway from the panel
 - **Event-driven monitoring** — watches netlink (`ip monitor route`), so lost routes are caught within a second of a VPN reconnect or resume, plus a periodic fallback check (15s–10min)
+- **Gateway-aware standby** — a route whose gateway is not on-link (wifi still reassociating after sleep, a foreign network, a VPN tunnel that's down) goes into *standby* instead of erroring: no apply attempts, no alerts, calm bar icon. The moment the gateway's subnet comes back, netlink wakes the plugin and the route is re-applied
 - **Auto-reapply** — optionally puts missing routes back automatically and silently
-- **Notifications** — desktop notification when routes go missing (or when a silent re-apply fails)
+- **Notifications** — desktop notification when routes go missing (or when a silent re-apply fails), with a 10-second grace so transient route churn (DHCP renews, reconnects) never pages you
 - **Root helper** — install once with a single password prompt, then all route operations are silent (a root-owned validating binary plus a `NOPASSWD` sudoers entry scoped to it — the Linux analogue of the macOS SUID helper). Without it, user-initiated applies go through `pkexec` and Omarchy's themed auth dialog.
 
 ## Install
@@ -36,6 +37,17 @@ Manual install: clone the repo to `~/.config/omarchy/plugins/pinroutes`, run `om
 3. **Install helper** (recommended) — in the HELPER section of the panel. One password prompt; after that, all route operations happen silently, which is what makes background auto-reapply possible.
 
 Bar icon: left-click opens the panel, right-click re-applies missing routes, middle-click re-verifies. In the panel: `j`/`k` move, `Enter` re-applies the selected route, `a` re-applies all, `n` adds a route, `r` refreshes, `Esc` closes.
+
+### Route states
+
+| State | Meaning | Behavior |
+|-------|---------|----------|
+| pinned | Route present with the right gateway | — |
+| missing | Gateway reachable but route absent | Auto-reapply fixes it silently; otherwise a notification after a 10s grace |
+| standby | Gateway not on-link on the current network | No apply attempts, no alerts; retried automatically when the gateway's subnet returns |
+| disabled | Rule turned off | Ignored |
+
+Standby mirrors the kernel's own nexthop rule: `ip route replace X via GW` only succeeds when `GW` is inside a directly-connected subnet, so PinRoutes checks that (from the route table it already reads) before acting. This is what keeps the plugin quiet when you resume from sleep before wifi is back, roam to a network where your routes don't apply, or drop a VPN tunnel whose far side hosts the gateway.
 
 ## Security
 

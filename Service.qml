@@ -31,10 +31,18 @@ Item {
   property bool helperInstalled: false
   property string lastError: ""
   property string actionStatus: ""
-  // Routes already notified/auto-applied since they last went missing, so a
-  // route that stays missing doesn't nag on every verify pass.
-  property var _handledMissing: ({})
+  // Per-route bookkeeping for the current "missing episode" — all keyed by
+  // rule id and cleared whenever a route leaves the missing state, so a route
+  // that stays missing doesn't nag on every verify pass but a fresh episode
+  // (after being active or in standby) gets handled again.
+  property var _missingSince: ({})   // id -> ms timestamp first seen missing
+  property var _autoTried: ({})      // id -> auto-reapply attempted
+  property var _notified: ({})       // id -> notification sent
   property bool _silentApply: false
+
+  // Grace before a missing-route notification: transient churn (DHCP renews,
+  // NetworkManager rewriting routes) usually settles well inside this window.
+  readonly property int notifyGraceMs: 10000
 
   readonly property bool applying: applyProcess.running
   readonly property bool busy: applyProcess.running || tableProcess.running || installProcess.running
@@ -53,11 +61,14 @@ Item {
   readonly property int enabledCount: countWhere(function(r) { return r.enabled })
   readonly property int missingCount: countStatus("missing")
   readonly property int activeCount: countStatus("active")
+  readonly property int standbyCount: countStatus("standby")
   readonly property string statusText: {
     if (!loaded) return "Loading…"
     if (routes.length === 0) return "No routes configured"
     if (enabledCount === 0) return "All routes disabled"
     if (missingCount > 0) return missingCount + (missingCount === 1 ? " route missing" : " routes missing")
+    if (activeCount > 0 && standbyCount > 0) return activeCount + " pinned · " + standbyCount + " standby"
+    if (standbyCount > 0) return standbyCount + (standbyCount === 1 ? " route standby" : " routes standby")
     if (!monitorEnabled) return "Monitoring off"
     return activeCount + (activeCount === 1 ? " route pinned" : " routes pinned")
   }
@@ -185,24 +196,47 @@ Item {
 
   function handleTable(entries) {
     statuses = Model.verifyStatuses(routes, entries)
-    var newlyMissing = []
-    var handled = {}
+    var now = Date.now()
+    var since = {}
+    var tried = {}
+    var noted = {}
+    var toAutoApply = []
+    var toNotify = []
+    var graceRunning = false
+
     for (var i = 0; i < routes.length; i++) {
       var rule = routes[i]
-      if (statuses[rule.id] !== "missing") continue
-      if (!_handledMissing[rule.id]) newlyMissing.push(rule)
-      handled[rule.id] = true
-    }
-    _handledMissing = handled
-    if (newlyMissing.length === 0) return
+      if (statuses[rule.id] !== "missing") continue // leaving "missing" resets the episode
+      since[rule.id] = _missingSince[rule.id] || now
+      tried[rule.id] = _autoTried[rule.id] === true
+      noted[rule.id] = _notified[rule.id] === true
 
-    if (autoReapply && helperInstalled && !applying) {
-      applyMissing(false)
-    } else {
-      var names = newlyMissing.map(function(r) { return r.name }).join(", ")
+      if (autoReapply && helperInstalled) {
+        if (!tried[rule.id]) {
+          toAutoApply.push(rule)
+          tried[rule.id] = true
+        }
+      } else if (!noted[rule.id]) {
+        if (now - since[rule.id] >= notifyGraceMs) {
+          toNotify.push(rule)
+          noted[rule.id] = true
+        } else {
+          graceRunning = true // still inside the grace window; check again soon
+        }
+      }
+    }
+
+    _missingSince = since
+    _autoTried = tried
+    _notified = noted
+
+    if (toAutoApply.length > 0 && !applying) applyRules(toAutoApply, false)
+    if (toNotify.length > 0) {
+      var names = toNotify.map(function(r) { return r.name }).join(", ")
       notify("critical", "Route missing",
              names + (autoReapply ? " — install the helper to enable silent re-apply" : " — open PinRoutes to re-apply"))
     }
+    if (graceRunning) notifyGraceTimer.restart()
   }
 
   // ---- apply ---------------------------------------------------------------
@@ -210,10 +244,10 @@ Item {
   function applyMissing(interactive) {
     var missing = []
     for (var i = 0; i < routes.length; i++) {
-      if (routes[i].enabled && statusOf(routes[i].id) !== "active") missing.push(routes[i])
+      if (statusOf(routes[i].id) === "missing") missing.push(routes[i])
     }
     if (missing.length === 0) {
-      if (interactive) flashStatus("All routes already pinned")
+      if (interactive) flashStatus(standbyCount > 0 ? "Nothing to fix — standby routes' gateway is unreachable" : "All routes already pinned")
       return
     }
     applyRules(missing, interactive)
@@ -359,7 +393,13 @@ Item {
         var err = String(applyStderr.text || "").trim()
         // pkexec exits 126/127 when the auth dialog is dismissed — not an error.
         if (exitCode === 126 || exitCode === 127) root.flashStatus("Authorization cancelled")
-        else {
+        else if (err.indexOf("invalid gateway") !== -1) {
+          // The gateway went off-net between verify and apply (wifi drop, VPN
+          // down). Not a failure worth alerting on: the re-verify below will
+          // classify the route as standby, and the netlink monitor retries
+          // the moment the gateway's subnet comes back.
+          root.flashStatus("Gateway unreachable — route on standby")
+        } else {
           root.lastError = err !== "" ? err : "Failed to apply routes (exit " + exitCode + ")"
           if (root._silentApply) root.notify("critical", "Route re-apply failed", root.lastError)
         }
@@ -427,6 +467,15 @@ Item {
     interval: root.intervalSec * 1000
     repeat: true
     running: root.loaded && root.monitorEnabled
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    // Re-verify shortly after the notification grace window ends, so a route
+    // that stays missing gets its alert even with no netlink event to force
+    // another pass.
+    id: notifyGraceTimer
+    interval: root.notifyGraceMs + 500
     onTriggered: root.refresh()
   }
 
