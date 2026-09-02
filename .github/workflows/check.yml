@@ -91,9 +91,10 @@ jobs:
           sudo grep -Eq '^#[0-9]+ ALL=\(root\) NOSETENV: NOPASSWD:' /etc/sudoers.d/pinroutes
           sudo grep -q 'env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PINROUTES_DEADLINE"' /etc/sudoers.d/pinroutes
           sudo grep -q 'env_keep -= "BASH_ENV' /etc/sudoers.d/pinroutes
-          # NOSETENV behavior, not just text: -E must be refused, and a
-          # caller BASH_ENV must never execute in the root shell
-          expect 1 sudo -n -E /usr/local/bin/pinroutes-helper delete 10.0.0.0/24 10.0.0.1
+          # NOSETENV behavior: a caller BASH_ENV must never execute in the
+          # root shell. (A `sudo -E` refusal test is not meaningful here —
+          # the runner's own blanket sudoers rule also matches and permits
+          # -E, so only the per-command env stripping can be asserted.)
           echo 'touch /tmp/pinroutes-canary-executed' > /tmp/pinroutes-canary.sh
           BASH_ENV=/tmp/pinroutes-canary.sh sudo -n /usr/local/bin/pinroutes-helper delete 10.0.0.0/24 10.0.0.1
           test ! -e /tmp/pinroutes-canary-executed
