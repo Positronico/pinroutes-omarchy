@@ -118,7 +118,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(360))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
@@ -476,11 +476,16 @@ Panel {
     }
   }
 
+  // Route details need the row's full width to stay readable, so only the
+  // status dot and the enable switch are permanent chrome. The action buttons
+  // share the name line and fade in on hover / keyboard cursor — they always
+  // occupy layout space so the row never jumps.
   component RouteRow: CursorSurface {
     id: routeRow
     property var rule: null
     property int rowIndex: 0
     readonly property string status: rule ? pin.statusOf(rule.id) : "unknown"
+    readonly property bool hot: hasCursor
 
     hasCursor: root.routeCursor === rowIndex
     foreground: root.foreground
@@ -516,14 +521,58 @@ Panel {
         Layout.fillWidth: true
         spacing: Style.space(1)
 
-        Text {
-          textFormat: Text.PlainText
+        RowLayout {
           Layout.fillWidth: true
-          text: routeRow.rule ? routeRow.rule.name : ""
-          color: routeRow.status === "disabled" ? root.dim : root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
+          spacing: Style.space(2)
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: routeRow.rule ? routeRow.rule.name : ""
+            color: routeRow.status === "disabled" ? root.dim : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          // Hover-revealed actions: they keep their slot when hidden so the
+          // row never shifts, and only accept clicks while shown.
+          PanelActionButton {
+            readonly property bool usable: routeRow.hot && routeRow.status !== "disabled" && routeRow.status !== "standby"
+            iconText: "󰑐"
+            tooltipText: "Re-apply now"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            opacity: usable ? 1.0 : 0.0
+            enabled: usable
+            Layout.alignment: Qt.AlignVCenter
+            Behavior on opacity { NumberAnimation { duration: 120 } }
+            onClicked: pin.applyRule(routeRow.rule)
+          }
+
+          PanelActionButton {
+            iconText: "󰏫"
+            tooltipText: "Edit"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            opacity: routeRow.hot ? 1.0 : 0.0
+            enabled: routeRow.hot
+            Layout.alignment: Qt.AlignVCenter
+            Behavior on opacity { NumberAnimation { duration: 120 } }
+            onClicked: root.openForm(routeRow.rule)
+          }
+
+          PanelActionButton {
+            iconText: "󰆴"
+            tooltipText: "Delete"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            opacity: routeRow.hot ? 1.0 : 0.0
+            enabled: routeRow.hot
+            Layout.alignment: Qt.AlignVCenter
+            Behavior on opacity { NumberAnimation { duration: 120 } }
+            onClicked: pin.removeRoute(routeRow.rule.id)
+          }
         }
 
         Text {
@@ -553,34 +602,6 @@ Panel {
         }
       }
 
-      PanelActionButton {
-        iconText: "󰑐"
-        tooltipText: "Re-apply now"
-        visible: routeRow.status !== "disabled" && routeRow.status !== "standby"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: pin.applyRule(routeRow.rule)
-      }
-
-      PanelActionButton {
-        iconText: "󰏫"
-        tooltipText: "Edit"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: root.openForm(routeRow.rule)
-      }
-
-      PanelActionButton {
-        iconText: "󰆴"
-        tooltipText: "Delete"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: pin.removeRoute(routeRow.rule.id)
-      }
-
       ToggleSwitch {
         id: enabledSwitch
         checked: routeRow.rule ? routeRow.rule.enabled : false
@@ -595,5 +616,6 @@ Panel {
         }
       }
     }
+
   }
 }
