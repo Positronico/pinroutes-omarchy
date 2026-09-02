@@ -140,17 +140,17 @@ recover_interrupted() {
     fi
     entries+=("$target|$backup|$old|$new")
     cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
-    [[ $cur == "$new" ]] || all_new=0
+    if ! [[ $cur == "$new" ]]; then all_new=0; fi
     if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
       # Backup on hand: verify it really is the recorded old content.
-      [[ $(sha_of "$backup") == "$old" ]] || restorable=0
+      if ! [[ $(sha_of "$backup") == "$old" ]]; then restorable=0; fi
     elif [[ $backup != "-" ]]; then
       # Backup gone: acceptable for rollback only if the target already IS
       # the old content (a previous recovery's verified restore).
-      [[ $cur == "$old" ]] || restorable=0
+      if ! [[ $cur == "$old" ]]; then restorable=0; fi
     else
       # Fresh target (no pre-transaction file): old state is ABSENT.
-      [[ $cur == ABSENT || $cur == "$new" ]] || restorable=0
+      if ! [[ $cur == ABSENT || $cur == "$new" ]]; then restorable=0; fi
     fi
   done <"$jfile"
 
@@ -166,17 +166,17 @@ recover_interrupted() {
       ((recovered)) || break
       IFS='|' read -r target backup old new <<<"$entry"
       if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
-        mv -fT -- "$backup" "$target" 2>/dev/null || recovered=0
+        if ! mv -fT -- "$backup" "$target" 2>/dev/null; then recovered=0; fi
       elif [[ $backup == "-" && -e $target ]]; then
-        rm -f -- "$target" 2>/dev/null || recovered=0
+        if ! rm -f -- "$target" 2>/dev/null; then recovered=0; fi
       fi
       # Verify the outcome is the recorded old state.
       if ((recovered)); then
         cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
         if [[ $backup == "-" ]]; then
-          [[ $cur == ABSENT ]] || recovered=0
+          if ! [[ $cur == ABSENT ]]; then recovered=0; fi
         else
-          [[ $cur == "$old" ]] || recovered=0
+          if ! [[ $cur == "$old" ]]; then recovered=0; fi
         fi
       fi
     done
@@ -185,10 +185,10 @@ recover_interrupted() {
   fi
 
   if ((recovered)); then
-    sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || recovered=0
+    if ! sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null; then recovered=0; fi
   fi
   if ((recovered)); then
-    rm -f -- "$JOURNAL" "$JOURNAL_DONE" 2>/dev/null || recovered=0
+    if ! rm -f -- "$JOURNAL" "$JOURNAL_DONE" 2>/dev/null; then recovered=0; fi
     sync "$ALLOW_DIR" 2>/dev/null || true # marker removal durability; recovery is idempotent if lost
   fi
   if ((! recovered)); then
@@ -373,13 +373,13 @@ rollback() {
         # Fail closed: a failed restore keeps the backup AND the live file —
         # never delete the only remaining copy of a target.
         if [[ -e $backup ]]; then
-          mv -fT -- "$backup" "$target" 2>/dev/null || rollback_ok=0
+          if ! mv -fT -- "$backup" "$target" 2>/dev/null; then rollback_ok=0; fi
         fi
         break
       fi
     done
     if ((! had_backup)); then
-      rm -f -- "$t" 2>/dev/null || rollback_ok=0
+      if ! rm -f -- "$t" 2>/dev/null; then rollback_ok=0; fi
     fi
   done
   published=()
@@ -505,7 +505,7 @@ while (($#)); do
     if ((enforce)); then
       allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    timeout -k 2 10 ip route replace "$net" via "$gw" || status=1
+    if ! timeout -k 2 10 ip route replace "$net" via "$gw"; then status=1; fi
     ;;
   delete)
     (($# >= 2)) || die "delete needs <cidr> <gateway>"
@@ -629,12 +629,12 @@ failed=0
 # state under the marker that the next run's recovery finishes cleaning.
 housekeeping_ok=1
 for entry in ${backups[@]+"${backups[@]}"}; do
-  rm -f -- "${entry%%|*}" 2>/dev/null || housekeeping_ok=0
+  if ! rm -f -- "${entry%%|*}" 2>/dev/null; then housekeeping_ok=0; fi
 done
 backups=() # cleanup() must not touch recovery data beyond this point
-sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null || housekeeping_ok=0
+if ! sync /usr/local/bin "$ALLOW_DIR" "$(dirname "$SUDOERS")" 2>/dev/null; then housekeeping_ok=0; fi
 if ((housekeeping_ok)); then
-  rm -f -- "$JOURNAL_DONE" 2>/dev/null || housekeeping_ok=0
+  if ! rm -f -- "$JOURNAL_DONE" 2>/dev/null; then housekeeping_ok=0; fi
   sync "$ALLOW_DIR" 2>/dev/null || true # marker removal durability; recovery is idempotent if lost
 fi
 if ((! housekeeping_ok)); then

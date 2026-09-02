@@ -84,7 +84,7 @@ while (($#)); do
     if ((enforce)); then
       allowed_pair "$net" "$gw" || deny "$net via $gw"
     fi
-    timeout -k 2 10 ip route replace "$net" via "$gw" || status=1
+    if ! timeout -k 2 10 ip route replace "$net" via "$gw"; then status=1; fi
     ;;
   delete)
     (($# >= 2)) || die "delete needs <cidr> <gateway>"
