@@ -28,26 +28,27 @@ jobs:
           jq -e '.schemaVersion == 1 and .id == "pinroutes" and (.version | type) == "string"
                  and (.kinds | length) > 0 and (.entryPoints | type) == "object"' manifest.json
 
-      - name: Helper allowlist enforcement (unshare sandbox)
+      - name: Helper allowlist enforcement
+        # Only denial paths run here — they are refused before ip(8) executes,
+        # so the runner's routing table is never touched.
         run: |
-          unshare -rm bash -s <<'EOF'
-          set -eu
-          mount -t tmpfs none /etc
-          mkdir -p /etc/pinroutes
-          printf '10.0.0.0/24 10.0.0.1\n' > /etc/pinroutes/routes.allow
+          set -u
           h=./helper/pinroutes-helper
+          sudo mkdir -p /etc/pinroutes
+          printf '10.0.0.0/24 10.0.0.1\n' | sudo tee /etc/pinroutes/routes.allow >/dev/null
+          expect() { # expect <code> <args...>
+            local want=$1 rc=0; shift
+            sudo "$h" "$@" 2>/dev/null || rc=$?
+            [ "$rc" -eq "$want" ] || { echo "FAIL: $* -> $rc (want $want)"; exit 1; }
+          }
           # unapproved routes must be denied (exit 3) before ip runs
-          for attack in "0.0.0.0/0 9.9.9.9" "0.0.0.0/1 9.9.9.9" "10.0.0.0/24 6.6.6.6"; do
-            set -- $attack
-            if "$h" replace "$1" "$2" 2>/dev/null; then exit 1; fi
-            [ $? -eq 3 ] || exit 1
-          done
+          expect 3 replace 0.0.0.0/0 9.9.9.9
+          expect 3 replace 0.0.0.0/1 9.9.9.9
+          expect 3 replace 10.0.0.0/24 6.6.6.6
+          expect 3 delete 192.168.0.0/16
           # sudo path without allowlist must fail closed
-          rm /etc/pinroutes/routes.allow
-          if SUDO_USER=ci "$h" replace 10.0.0.0/24 10.0.0.1 2>/dev/null; then exit 1; fi
-          [ $? -eq 3 ] || exit 1
+          sudo rm /etc/pinroutes/routes.allow
+          expect 3 replace 10.0.0.0/24 10.0.0.1
           # syntax validation independent of policy
-          if "$h" replace "10.0.0.0/16;x" 10.0.0.1 2>/dev/null; then exit 1; fi
-          [ $? -eq 2 ] || exit 1
+          expect 2 replace "10.0.0.0/16;x" 10.0.0.1
           echo "enforcement OK"
-          EOF
