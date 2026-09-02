@@ -20,6 +20,11 @@ jobs:
       - name: Python syntax
         run: python3 -m py_compile stateio.py
 
+      - name: Privileged components carry their own whole-invocation deadline
+        run: |
+          grep -Eq '^ *exec timeout -k 5 60 "\$0"' helper/pinroutes-helper
+          grep -Eq '^ *exec timeout -k 5 60 "\$0"' helper/pinroutes-helper-install
+
       - name: Embedded helper matches helper/pinroutes-helper
         run: |
           sed -n '/^cat >"\$helper_tmp" <<.EMBEDDED_HELPER.$/,/^EMBEDDED_HELPER$/p' \
@@ -79,9 +84,14 @@ jobs:
           # No staging leftovers
           ! ls /usr/local/bin/.pinroutes-stage.* 2>/dev/null
           # Self-installed approver is runnable and re-approves on its own
+          # (update-in-place exercises the backup/publish path)
           sudo /usr/local/bin/pinroutes-approve --approve 10.9.0.0/24 10.9.0.1
           grep -qxF '10.9.0.0/24 10.9.0.1' /etc/pinroutes/routes.allow
           ! grep -q '10.0.0.0/24' /etc/pinroutes/routes.allow
+          for d in /usr/local/bin /etc/pinroutes /etc/sudoers.d; do
+            ! ls "$d"/.*.pinroutes-prev.* 2>/dev/null
+            ! ls "$d"/.pinroutes-stage.* 2>/dev/null
+          done
           # Enforcement: unapproved routes denied before ip runs
           h=/usr/local/bin/pinroutes-helper
           expect 3 sudo "$h" replace 0.0.0.0/0 9.9.9.9

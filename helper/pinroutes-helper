@@ -22,6 +22,15 @@
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+# Whole-invocation deadline, enforced in the privileged context itself:
+# re-exec once under timeout(1) (TERM after 60s, KILL 5s later) so the total
+# runtime is bounded root-side regardless of what the unprivileged caller
+# does. Skipped only when $0 is not a real executable (bash -c invocation).
+if [[ -z ${PINROUTES_DEADLINE:-} && -x $0 ]]; then
+  export PINROUTES_DEADLINE=1
+  exec timeout -k 5 60 "$0" "$@"
+fi
+
 ALLOW=/etc/pinroutes/routes.allow
 MAX_OPS=128
 

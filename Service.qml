@@ -67,9 +67,11 @@ Item {
   property bool approveToolInstalled: false
 
   // The command the user runs once in a terminal to install and approve.
+  // routes.length is capped at Model.MAX_ROUTES at every boundary (add,
+  // update, restore), so no slicing happens here.
   readonly property string installCommand: {
     var cmd = "sudo " + Util.shellQuote(installScriptPath) + " --approve"
-    for (var i = 0; i < routes.length && i < 100; i++) {
+    for (var i = 0; i < routes.length; i++) {
       cmd += " " + routes[i].network + " " + routes[i].gateway
     }
     return cmd
@@ -140,6 +142,7 @@ Item {
   // ---- rule CRUD (each returns "" or a validation error) -------------------
 
   function addRoute(name, network, gateway) {
+    if (routes.length >= Model.MAX_ROUTES) return "Route limit reached (" + Model.MAX_ROUTES + ")"
     var v = Model.validateRule(name, network, gateway)
     if (!v.ok) return v.error
     var next = routes.slice()
@@ -355,7 +358,7 @@ Item {
       return
     }
     var cmd = ["pkexec", approveDest, "--approve"]
-    for (var i = 0; i < routes.length && i < 100; i++) {
+    for (var i = 0; i < routes.length; i++) {
       cmd.push(routes[i].network, routes[i].gateway)
     }
     installProcess.command = cmd
