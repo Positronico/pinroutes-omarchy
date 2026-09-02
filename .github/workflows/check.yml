@@ -1,0 +1,53 @@
+name: check
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          bash -n helper/pinroutes-helper
+          bash -n helper/pinroutes-helper-install
+
+      - name: Python syntax
+        run: python3 -m py_compile stateio.py
+
+      - name: Embedded helper matches helper/pinroutes-helper
+        run: |
+          sed -n '/^cat >"\$helper_tmp" <<.EMBEDDED_HELPER.$/,/^EMBEDDED_HELPER$/p' \
+            helper/pinroutes-helper-install | sed '1d;$d' \
+            | diff - helper/pinroutes-helper
+
+      - name: Manifest is valid JSON with required fields
+        run: |
+          jq -e '.schemaVersion == 1 and .id == "pinroutes" and (.version | type) == "string"
+                 and (.kinds | length) > 0 and (.entryPoints | type) == "object"' manifest.json
+
+      - name: Helper allowlist enforcement (unshare sandbox)
+        run: |
+          unshare -rm bash -s <<'EOF'
+          set -eu
+          mount -t tmpfs none /etc
+          mkdir -p /etc/pinroutes
+          printf '10.0.0.0/24 10.0.0.1\n' > /etc/pinroutes/routes.allow
+          h=./helper/pinroutes-helper
+          # unapproved routes must be denied (exit 3) before ip runs
+          for attack in "0.0.0.0/0 9.9.9.9" "0.0.0.0/1 9.9.9.9" "10.0.0.0/24 6.6.6.6"; do
+            set -- $attack
+            if "$h" replace "$1" "$2" 2>/dev/null; then exit 1; fi
+            [ $? -eq 3 ] || exit 1
+          done
+          # sudo path without allowlist must fail closed
+          rm /etc/pinroutes/routes.allow
+          if SUDO_USER=ci "$h" replace 10.0.0.0/24 10.0.0.1 2>/dev/null; then exit 1; fi
+          [ $? -eq 3 ] || exit 1
+          # syntax validation independent of policy
+          if "$h" replace "10.0.0.0/16;x" 10.0.0.1 2>/dev/null; then exit 1; fi
+          [ $? -eq 2 ] || exit 1
+          echo "enforcement OK"
+          EOF
