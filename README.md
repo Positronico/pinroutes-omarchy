@@ -14,7 +14,7 @@ This is the Linux/Omarchy port of the [PinRoutes macOS menu bar app](https://git
 - **Gateway-aware standby** — a route whose gateway is not on-link (wifi still reassociating after sleep, a foreign network, a VPN tunnel that's down) goes into *standby* instead of erroring: no apply attempts, no alerts, calm bar icon. The moment the gateway's subnet comes back, netlink wakes the plugin and the route is re-applied
 - **Auto-reapply** — optionally puts missing routes back automatically and silently
 - **Notifications** — desktop notification when routes go missing (or when a silent re-apply fails), with a 10-second grace so transient route churn (DHCP renews, reconnects) never pages you
-- **Root helper** — install once with a single password prompt, then all route operations are silent (a root-owned validating binary plus a `NOPASSWD` sudoers entry scoped to it — the Linux analogue of the macOS SUID helper). Without it, user-initiated applies go through `pkexec` and Omarchy's themed auth dialog.
+- **Root helper with route approval** — one authenticated prompt installs a root-owned helper and approves your exact routes into a root-owned allowlist; after that, approved routes re-apply silently (`NOPASSWD` sudoers entry scoped to the helper, which refuses anything outside the allowlist). Changing routes later takes one re-approval prompt. Without the helper, user-initiated applies go through `pkexec` and Omarchy's themed auth dialog.
 
 ## Install
 
@@ -34,7 +34,7 @@ Manual install: clone the repo to `~/.config/omarchy/plugins/pinroutes`, run `om
 
 1. Click the 󰐃 icon in the bar, hit **+**, enter a name, CIDR network (e.g. `10.255.0.0/16`), and gateway (e.g. `10.0.0.1`).
 2. Enabled routes are verified continuously; re-apply manually with the refresh button (or right-click the bar icon), or turn on **Auto-reapply**.
-3. **Install helper** (recommended) — in the HELPER section of the panel. One password prompt; after that, all route operations happen silently, which is what makes background auto-reapply possible.
+3. **Install helper** (recommended) — in the HELPER section of the panel. One password prompt installs the helper *and approves your current routes*; after that, approved routes re-apply silently, which is what makes background auto-reapply possible. When you later add or edit a route, the panel offers **Approve route changes** (one prompt) to extend silent re-apply to it.
 
 Bar icon: left-click opens the panel, right-click re-applies missing routes, middle-click re-verifies. In the panel: `j`/`k` move, `Enter` re-applies the selected route, `a` re-applies all, `n` adds a route, `r` refreshes, `Esc` closes.
 
@@ -51,23 +51,25 @@ Standby mirrors the kernel's own nexthop rule: `ip route replace X via GW` only 
 
 ## Security
 
-Changing routes requires root, so this plugin has a deliberately small privileged surface. Full disclosure for reviewers and the appropriately suspicious:
+Changing routes requires root, so this plugin has a deliberately small, policy-bound privileged surface. Full disclosure for reviewers and the appropriately suspicious:
 
-- **`helper/pinroutes-helper`** — a ~50-line bash script whose entire command surface is `ip route replace <cidr> via <gateway>` and `ip route del <cidr>`. Every argument is regex-validated (strict IPv4/CIDR) before `ip` runs; anything else exits without executing.
-- **Without the helper installed**, user-initiated applies run it via `pkexec` (Omarchy's themed polkit dialog, one prompt per operation). The background monitor *never* invokes pkexec — if it can't fix a route silently, it only notifies.
-- **"Install helper"** runs `helper/pinroutes-helper-install` via `pkexec`, which copies the helper root-owned (0755) to `/usr/local/bin/pinroutes-helper` and writes `/etc/sudoers.d/pinroutes` (0440, validated with `visudo -cf` before install):
+- **`helper/pinroutes-helper`** — a bash script whose entire command surface is `ip route replace <cidr> via <gateway>` and `ip route del <cidr>`, capped at 128 operations per invocation. Two validation layers:
+  1. *Syntax*: every argument must be a well-formed IPv4 CIDR / address (strict regex, checked before `ip` runs).
+  2. *Policy*: whenever the root-owned allowlist `/etc/pinroutes/routes.allow` exists — and always when running under sudo — each operation must exactly match an approved `<network> <gateway>` pair. The passwordless path **fails closed**: under sudo with no allowlist, everything is refused. This is what stops an arbitrary same-user process from using the NOPASSWD entry to hijack the default route (`0.0.0.0/0`, or the `/1`-pair equivalent) or any other unapproved route.
+- **"Install helper" / "Approve route changes"** runs `helper/pinroutes-helper-install --approve <pairs...>` via `pkexec`. The installer is self-contained: the helper it installs is **embedded in the installer itself** (root never copies a second user-writable file), the invoking user is derived from **`PKEXEC_UID`/`SUDO_UID`** (never from arguments or ambient environment strings), route pairs are re-validated and capped at 100, and it writes:
+  - `/usr/local/bin/pinroutes-helper` (root:root 0755)
+  - `/etc/pinroutes/routes.allow` (root:root 0644) — exactly the approved pairs
+  - `/etc/sudoers.d/pinroutes` (root:root 0440, `visudo -cf`-validated): `<you> ALL=(root) NOPASSWD: /usr/local/bin/pinroutes-helper`
 
-  ```
-  <you> ALL=(root) NOPASSWD: /usr/local/bin/pinroutes-helper
-  ```
-
-  This is a passwordless rule scoped to that single fixed-purpose binary — the Linux analogue of the macOS app's SUID helper. It is what makes silent background re-apply possible.
-- **Nothing else**: no network access, no downloads, no bundled binaries, no services. The plugin only ever executes `ip`, `notify-send`, `python3 stateio.py` (config file I/O), and the helper via `sudo -n`/`pkexec`.
+  Adding or editing a route later requires one re-approval prompt; until then the new route is applied only through per-operation `pkexec` and is marked "not yet approved" in the panel.
+- **Without the helper installed**, user-initiated applies run the in-repo helper via `pkexec` (one themed auth prompt per operation — each invocation individually authenticated, so syntax-only validation applies). The background monitor *never* invokes pkexec — if it can't fix a route silently, it only notifies.
+- **State I/O** (`stateio.py`) opens the config with `O_NOFOLLOW|O_NONBLOCK` and refuses anything that is not a regular, self-owned, single-link file; writes are atomic (same-dir temp + rename) and payloads bounded at 1 MB.
+- **Nothing else**: no network access, no downloads, no bundled binaries, no services. The plugin only ever executes `ip`, `notify-send`, `python3 stateio.py`, and the helper via `sudo -n`/`pkexec`. Route counts (100), name lengths (100), helper operations (128), parsed process output, and monitor restarts (exponential backoff) are all bounded.
 
 Uninstall the helper from the panel, or manually:
 
 ```bash
-sudo rm /usr/local/bin/pinroutes-helper /etc/sudoers.d/pinroutes
+sudo rm /usr/local/bin/pinroutes-helper /etc/sudoers.d/pinroutes /etc/pinroutes/routes.allow
 ```
 
 ## Dependencies

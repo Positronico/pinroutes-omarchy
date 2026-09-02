@@ -29,6 +29,11 @@ Item {
   property var statuses: ({})        // id -> active | missing | disabled
   property bool loaded: false
   property bool helperInstalled: false
+  // "<network> <gateway>" pairs from the root-owned allowlist. The installed
+  // helper only acts on approved pairs, so silent operations are limited to
+  // routes the user has explicitly approved through an authenticated prompt.
+  property var approvedMap: ({})
+  property var _pendingApply: []
   property string lastError: ""
   property string actionStatus: ""
   // Per-route bookkeeping for the current "missing episode" — all keyed by
@@ -56,9 +61,14 @@ Item {
     if (!base) base = Quickshell.env("HOME") + "/.config"
     return base + "/pinroutes/pinroutes.json"
   }
-  readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME") || ""
 
   readonly property int enabledCount: countWhere(function(r) { return r.enabled })
+  readonly property int unapprovedCount: {
+    if (!helperInstalled) return 0
+    var n = 0
+    for (var i = 0; i < routes.length; i++) if (!isApproved(routes[i])) n++
+    return n
+  }
   readonly property int missingCount: countStatus("missing")
   readonly property int activeCount: countStatus("active")
   readonly property int standbyCount: countStatus("standby")
@@ -87,6 +97,10 @@ Item {
 
   function statusOf(id) {
     return statuses[id] || "unknown"
+  }
+
+  function isApproved(rule) {
+    return rule && approvedMap[rule.network + " " + rule.gateway] === true
   }
 
   function flashStatus(text) {
@@ -211,7 +225,7 @@ Item {
       tried[rule.id] = _autoTried[rule.id] === true
       noted[rule.id] = _notified[rule.id] === true
 
-      if (autoReapply && helperInstalled) {
+      if (autoReapply && helperInstalled && isApproved(rule)) {
         if (!tried[rule.id]) {
           toAutoApply.push(rule)
           tried[rule.id] = true
@@ -258,16 +272,29 @@ Item {
   }
 
   function applyRules(rules, interactive) {
+    // With the helper installed, the allowlist gates every sudo call: rules
+    // not yet approved need an authenticated approval first, after which the
+    // apply is retried automatically (see installProcess/checkHelper).
+    if (helperInstalled && interactive) {
+      var unapproved = rules.filter(function(r) { return !isApproved(r) })
+      if (unapproved.length > 0) {
+        _pendingApply = rules
+        approveRoutes()
+        return
+      }
+    }
     var args = []
     for (var i = 0; i < rules.length; i++) {
+      if (helperInstalled && !isApproved(rules[i])) continue // silent path: approved only
       args.push("replace", rules[i].network, rules[i].gateway)
     }
     runHelper(args, interactive)
   }
 
   // Route changes need root. With the helper installed, sudo -n runs it
-  // silently; otherwise pkexec pops the shell's themed auth dialog — but only
-  // for user-initiated actions, never from the background monitor.
+  // silently (allowlist-enforced); otherwise pkexec pops the shell's themed
+  // auth dialog — but only for user-initiated actions, never from the
+  // background monitor.
   function runHelper(args, interactive) {
     if (applyProcess.running || args.length === 0) return
     var cmd
@@ -287,14 +314,26 @@ Item {
     helperCheckProcess.running = true
   }
 
-  function installHelper() {
-    if (installProcess.running || userName === "") return
-    installProcess.command = ["pkexec", installScriptPath, localHelperPath, userName]
+  // One authenticated prompt installs the helper and approves the current
+  // route set: the installer embeds the helper and writes the root-owned
+  // allowlist, so later silent applies can only touch these exact pairs.
+  function approveRoutes() {
+    if (installProcess.running) return
+    var cmd = ["pkexec", installScriptPath, "--approve"]
+    for (var i = 0; i < routes.length; i++) {
+      cmd.push(routes[i].network, routes[i].gateway)
+    }
+    installProcess.command = cmd
     installProcess.running = true
+  }
+
+  function installHelper() {
+    approveRoutes()
   }
 
   function uninstallHelper() {
     if (installProcess.running) return
+    _pendingApply = []
     installProcess.command = ["pkexec", installScriptPath, "--uninstall"]
     installProcess.running = true
   }
@@ -370,9 +409,14 @@ Item {
     stdout: StdioCollector { id: tableStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) return
+      var text = String(tableStdout.text || "[]")
+      if (text.length > 4 * 1024 * 1024) {
+        console.warn("pinroutes: route table output unexpectedly large, skipping")
+        return
+      }
       var entries = []
       try {
-        entries = JSON.parse(String(tableStdout.text || "[]"))
+        entries = JSON.parse(text)
       } catch (e) {
         console.warn("pinroutes: could not parse route table:", e)
         return
@@ -410,9 +454,29 @@ Item {
 
   Process {
     id: helperCheckProcess
-    command: ["bash", "-c", "test -x " + root.helperDest + " && sudo -n -l " + root.helperDest + " >/dev/null 2>&1"]
+    command: ["bash", "-c",
+      "test -x " + root.helperDest + " && sudo -n -l " + root.helperDest + " >/dev/null 2>&1"
+      + " && { echo __PINROUTES_OK__; head -c 65536 /etc/pinroutes/routes.allow 2>/dev/null; }"]
+    stdout: StdioCollector { id: helperCheckStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.helperInstalled = exitCode === 0
+      var lines = String(helperCheckStdout.text || "").split("\n")
+      var installed = exitCode === 0 && lines[0] === "__PINROUTES_OK__"
+      var approved = {}
+      if (installed) {
+        for (var i = 1; i < lines.length && i <= 200; i++) {
+          var line = lines[i].trim()
+          if (line !== "") approved[line] = true
+        }
+      }
+      root.helperInstalled = installed
+      root.approvedMap = approved
+      // An approval was waiting on this recheck: retry the apply that
+      // triggered it, now allowed through the sudo path.
+      if (root._pendingApply.length > 0) {
+        var pending = root._pendingApply
+        root._pendingApply = []
+        if (installed) root.applyRules(pending, true)
+      }
     }
   }
 
@@ -421,12 +485,12 @@ Item {
     stderr: StdioCollector { id: installStderr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        root.flashStatus("Done")
+        root.flashStatus("Routes approved")
         root.lastError = ""
-      } else if (exitCode === 126 || exitCode === 127) {
-        root.flashStatus("Authorization cancelled")
       } else {
-        root.lastError = String(installStderr.text || "").trim() || "Helper install failed"
+        root._pendingApply = []
+        if (exitCode === 126 || exitCode === 127) root.flashStatus("Authorization cancelled")
+        else root.lastError = String(installStderr.text || "").trim() || "Helper install failed"
       }
       root.checkHelper()
     }
@@ -437,11 +501,21 @@ Item {
   // instead of waiting out the periodic interval.
   Process {
     id: monitorProcess
+    property int failures: 0
     command: ["ip", "-4", "monitor", "route"]
     stdout: SplitParser {
-      onRead: function(line) { verifyDebounce.restart() }
+      onRead: function(line) {
+        monitorProcess.failures = 0 // it's producing events, so it's healthy
+        verifyDebounce.restart()
+      }
     }
-    onExited: monitorRestart.restart()
+    onExited: {
+      // Escalating backoff so a persistently failing monitor (ip missing,
+      // netlink refused) cannot spin the shell in a tight restart loop.
+      failures = Math.min(failures + 1, 6)
+      monitorRestart.interval = 3000 * Math.pow(2, failures - 1)
+      monitorRestart.restart()
+    }
   }
 
   function syncMonitor() {

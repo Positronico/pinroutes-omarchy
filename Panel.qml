@@ -94,6 +94,11 @@ Panel {
     function refresh(): string { pin.refresh(); return "ok" }
     function apply(): string { pin.applyMissing(true); return "ok" }
     function status(): string { return pin.statusText }
+    function helper(): string {
+      return "installed=" + pin.helperInstalled
+        + " routes=" + pin.routes.length
+        + " unapproved=" + pin.unapprovedCount
+    }
   }
 
   BarIconButton {
@@ -438,7 +443,64 @@ Panel {
 
                   Text {
                     Layout.fillWidth: true
-                    text: "One password prompt now; silent route fixes forever after"
+                    text: "One password prompt approves your routes for silent re-apply"
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+                }
+              }
+            }
+
+            CursorSurface {
+              visible: pin.helperInstalled && pin.unapprovedCount > 0
+              width: parent.width
+              implicitHeight: approveRow.implicitHeight + Style.spacing.rowPaddingX
+              foreground: root.foreground
+              fill: root.hoverFill
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: pin.approveRoutes()
+              }
+
+              RowLayout {
+                id: approveRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                Text {
+                  text: "󰌾"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.heading
+                  Layout.alignment: Qt.AlignVCenter
+                }
+
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(1)
+
+                  Text {
+                    Layout.fillWidth: true
+                    text: "Approve route changes"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    Layout.fillWidth: true
+                    text: pin.unapprovedCount + (pin.unapprovedCount === 1 ? " route needs" : " routes need")
+                          + " root approval for silent re-apply"
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -455,7 +517,9 @@ Panel {
 
               Text {
                 Layout.fillWidth: true
-                text: "Helper installed — route fixes are silent"
+                text: pin.unapprovedCount === 0
+                      ? "Helper installed — approved routes re-apply silently"
+                      : "Helper installed"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -595,6 +659,17 @@ Panel {
           Layout.fillWidth: true
           visible: routeRow.status === "standby"
           text: "󰒲 gateway unreachable"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          visible: pin.helperInstalled && !pin.isApproved(routeRow.rule) && routeRow.status !== "disabled"
+          text: "󰌾 not yet approved for silent re-apply"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

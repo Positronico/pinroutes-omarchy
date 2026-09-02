@@ -1,15 +1,31 @@
 #!/usr/bin/env bash
 # PinRoutes privileged helper: the only thing it knows how to do is add or
-# remove IPv4 static routes via ip(8), with every argument validated first.
-# The Linux analogue of the macOS app's SUID helper — installed root-owned to
-# /usr/local/bin with a NOPASSWD sudoers entry scoped to this one binary so
-# background re-applies are silent. Also runnable via pkexec when not installed.
+# remove IPv4 static routes via ip(8), and only routes the user has approved.
+#
+# Two layers of validation:
+#   1. Syntax: every argument must be a well-formed IPv4 CIDR / address.
+#   2. Policy: when the root-owned allowlist (/etc/pinroutes/routes.allow,
+#      written by pinroutes-helper-install during an authenticated approval)
+#      exists — and always when running under sudo — each operation must match
+#      an approved "<network> <gateway>" pair. This is what keeps the NOPASSWD
+#      sudoers path from being usable by arbitrary same-user processes to
+#      hijack the default route (or any other unapproved route).
+#
+# Without the allowlist and outside sudo (the pkexec per-operation path, where
+# every invocation is individually authenticated by the user), syntax-only
+# validation applies.
+#
+# NOTE: pinroutes-helper-install embeds a copy of this script — keep in sync.
 #
 # Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)...
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+ALLOW=/etc/pinroutes/routes.allow
+MAX_OPS=128
+
 die() { echo "pinroutes-helper: $*" >&2; exit 2; }
+deny() { echo "pinroutes-helper: not approved: $*" >&2; exit 3; }
 
 valid_ip() {
   local ip=$1 o
@@ -27,10 +43,32 @@ valid_cidr() {
   ((10#${net#*/} <= 32)) || return 1
 }
 
+# Enforce the allowlist whenever it exists, and unconditionally under sudo:
+# the passwordless path must never run unrestricted, even if the allowlist
+# has been removed out from under it.
+enforce=0
+[[ -f $ALLOW || -n ${SUDO_USER:-} ]] && enforce=1
+
+allowed_pair() {
+  [[ -f $ALLOW ]] || return 1
+  grep -qxF -- "$1 $2" "$ALLOW"
+}
+
+allowed_net() {
+  local n g
+  [[ -f $ALLOW ]] || return 1
+  while read -r n g; do
+    [[ $n == "$1" ]] && return 0
+  done <"$ALLOW"
+  return 1
+}
+
 (($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)..."
 
+ops=0
 status=0
 while (($#)); do
+  ((++ops <= MAX_OPS)) || die "too many operations (max $MAX_OPS)"
   action=$1
   shift
   case $action in
@@ -40,6 +78,9 @@ while (($#)); do
     shift 2
     valid_cidr "$net" || die "invalid network: $net"
     valid_ip "$gw" || die "invalid gateway: $gw"
+    if ((enforce)); then
+      allowed_pair "$net" "$gw" || deny "$net via $gw"
+    fi
     ip route replace "$net" via "$gw" || status=1
     ;;
   delete)
@@ -47,6 +88,9 @@ while (($#)); do
     net=$1
     shift
     valid_cidr "$net" || die "invalid network: $net"
+    if ((enforce)); then
+      allowed_net "$net" || deny "$net"
+    fi
     ip route del "$net" 2>/dev/null || true
     ;;
   *)

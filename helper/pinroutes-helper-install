@@ -1,42 +1,203 @@
 #!/usr/bin/env bash
-# Installs (or removes) the PinRoutes helper system-wide. Run as root via
-# pkexec from the panel's "Install helper" action. Copies the helper to
-# /usr/local/bin and grants the invoking user a NOPASSWD sudoers entry scoped
-# to that one binary, so route re-applies never prompt for a password —
-# the Linux analogue of the macOS app's one-time SUID helper install.
+# PinRoutes privileged installer / route approver. Run as root via pkexec
+# from the panel's "Install helper" / "Approve route changes" actions.
 #
-# Usage: pinroutes-helper-install <helper-source> <username>
-#        pinroutes-helper-install --uninstall
+#   pinroutes-helper-install --approve [<cidr> <gateway>]...
+#       Installs the helper (embedded below — nothing is copied from a
+#       user-writable path), writes the root-owned allowlist with exactly
+#       the given route pairs, and grants the invoking user a NOPASSWD
+#       sudoers entry scoped to the installed helper. The invoking user is
+#       taken from PKEXEC_UID (set by pkexec) or SUDO_UID — never from
+#       arguments or ambient environment strings.
+#
+#   pinroutes-helper-install --uninstall
+#       Removes the helper, the sudoers entry, and the allowlist.
+#
+# The helper is embedded as a quoted heredoc so root never executes or copies
+# content from a path the user can rewrite after approval. Keep the embedded
+# copy in sync with helper/pinroutes-helper.
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-DEST=/usr/local/bin/pinroutes-helper
+HELPER_DEST=/usr/local/bin/pinroutes-helper
 SUDOERS=/etc/sudoers.d/pinroutes
+ALLOW_DIR=/etc/pinroutes
+ALLOW=$ALLOW_DIR/routes.allow
+MAX_ROUTES=100
 
 die() { echo "pinroutes-helper-install: $*" >&2; exit 2; }
 
 ((EUID == 0)) || die "must run as root (via pkexec)"
 
 if [[ ${1:-} == "--uninstall" ]]; then
-  rm -f "$DEST" "$SUDOERS"
-  echo "removed $DEST and $SUDOERS"
+  rm -f "$HELPER_DEST" "$SUDOERS" "$ALLOW"
+  rmdir "$ALLOW_DIR" 2>/dev/null || true
+  echo "removed $HELPER_DEST, $SUDOERS and $ALLOW"
   exit 0
 fi
 
-src=${1:-}
-user=${2:-}
-[[ -f $src ]] || die "helper source not found: $src"
-[[ $user =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*\$?$ ]] || die "invalid username: $user"
-id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
+[[ ${1:-} == "--approve" ]] || die "usage: pinroutes-helper-install --approve [<cidr> <gateway>]... | --uninstall"
+shift
 
-install -o root -g root -m 0755 "$src" "$DEST"
+# The invoking user comes from the privilege-escalation mechanism itself,
+# not from anything the caller can freely choose.
+uid=${PKEXEC_UID:-${SUDO_UID:-}}
+[[ $uid =~ ^[0-9]+$ ]] || die "cannot determine invoking user (need PKEXEC_UID or SUDO_UID)"
+((uid != 0)) || die "refusing to approve for root"
+user=$(id -nu "$uid") || die "no user with uid $uid"
 
-tmp=$(mktemp)
-printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$DEST" >"$tmp"
-if ! visudo -cf "$tmp" >/dev/null; then
-  rm -f "$tmp"
+valid_ip() {
+  local ip=$1 o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1:4}"; do
+    ((10#$o <= 255)) || return 1
+  done
+}
+
+valid_cidr() {
+  local net=$1
+  [[ $net == */* ]] || return 1
+  valid_ip "${net%/*}" || return 1
+  [[ ${net#*/} =~ ^[0-9]{1,2}$ ]] || return 1
+  ((10#${net#*/} <= 32)) || return 1
+}
+
+(($# % 2 == 0)) || die "route pairs must be <cidr> <gateway>"
+(($# / 2 <= MAX_ROUTES)) || die "too many routes (max $MAX_ROUTES)"
+
+pairs=()
+while (($#)); do
+  net=$1 gw=$2
+  shift 2
+  valid_cidr "$net" || die "invalid network: $net"
+  valid_ip "$gw" || die "invalid gateway: $gw"
+  pairs+=("$net $gw")
+done
+
+# ---- embedded helper (keep in sync with helper/pinroutes-helper) -----------
+helper_tmp=$(mktemp)
+trap 'rm -f "$helper_tmp"' EXIT
+cat >"$helper_tmp" <<'EMBEDDED_HELPER'
+#!/usr/bin/env bash
+# PinRoutes privileged helper: the only thing it knows how to do is add or
+# remove IPv4 static routes via ip(8), and only routes the user has approved.
+#
+# Two layers of validation:
+#   1. Syntax: every argument must be a well-formed IPv4 CIDR / address.
+#   2. Policy: when the root-owned allowlist (/etc/pinroutes/routes.allow,
+#      written by pinroutes-helper-install during an authenticated approval)
+#      exists — and always when running under sudo — each operation must match
+#      an approved "<network> <gateway>" pair. This is what keeps the NOPASSWD
+#      sudoers path from being usable by arbitrary same-user processes to
+#      hijack the default route (or any other unapproved route).
+#
+# Without the allowlist and outside sudo (the pkexec per-operation path, where
+# every invocation is individually authenticated by the user), syntax-only
+# validation applies.
+#
+# NOTE: pinroutes-helper-install embeds a copy of this script — keep in sync.
+#
+# Usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)...
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ALLOW=/etc/pinroutes/routes.allow
+MAX_OPS=128
+
+die() { echo "pinroutes-helper: $*" >&2; exit 2; }
+deny() { echo "pinroutes-helper: not approved: $*" >&2; exit 3; }
+
+valid_ip() {
+  local ip=$1 o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1:4}"; do
+    ((10#$o <= 255)) || return 1
+  done
+}
+
+valid_cidr() {
+  local net=$1
+  [[ $net == */* ]] || return 1
+  valid_ip "${net%/*}" || return 1
+  [[ ${net#*/} =~ ^[0-9]{1,2}$ ]] || return 1
+  ((10#${net#*/} <= 32)) || return 1
+}
+
+# Enforce the allowlist whenever it exists, and unconditionally under sudo:
+# the passwordless path must never run unrestricted, even if the allowlist
+# has been removed out from under it.
+enforce=0
+[[ -f $ALLOW || -n ${SUDO_USER:-} ]] && enforce=1
+
+allowed_pair() {
+  [[ -f $ALLOW ]] || return 1
+  grep -qxF -- "$1 $2" "$ALLOW"
+}
+
+allowed_net() {
+  local n g
+  [[ -f $ALLOW ]] || return 1
+  while read -r n g; do
+    [[ $n == "$1" ]] && return 0
+  done <"$ALLOW"
+  return 1
+}
+
+(($# > 0)) || die "usage: pinroutes-helper (replace <cidr> <gateway> | delete <cidr>)..."
+
+ops=0
+status=0
+while (($#)); do
+  ((++ops <= MAX_OPS)) || die "too many operations (max $MAX_OPS)"
+  action=$1
+  shift
+  case $action in
+  replace)
+    (($# >= 2)) || die "replace needs <cidr> <gateway>"
+    net=$1 gw=$2
+    shift 2
+    valid_cidr "$net" || die "invalid network: $net"
+    valid_ip "$gw" || die "invalid gateway: $gw"
+    if ((enforce)); then
+      allowed_pair "$net" "$gw" || deny "$net via $gw"
+    fi
+    ip route replace "$net" via "$gw" || status=1
+    ;;
+  delete)
+    (($# >= 1)) || die "delete needs <cidr>"
+    net=$1
+    shift
+    valid_cidr "$net" || die "invalid network: $net"
+    if ((enforce)); then
+      allowed_net "$net" || deny "$net"
+    fi
+    ip route del "$net" 2>/dev/null || true
+    ;;
+  *)
+    die "unknown action: $action"
+    ;;
+  esac
+done
+exit $status
+EMBEDDED_HELPER
+# ---------------------------------------------------------------------------
+
+install -o root -g root -m 0755 "$helper_tmp" "$HELPER_DEST"
+
+install -d -o root -g root -m 0755 "$ALLOW_DIR"
+allow_tmp=$(mktemp)
+printf '%s\n' "${pairs[@]:-}" | sed '/^$/d' >"$allow_tmp"
+install -o root -g root -m 0644 "$allow_tmp" "$ALLOW"
+rm -f "$allow_tmp"
+
+install -d -o root -g root -m 0750 "$(dirname "$SUDOERS")"
+sudoers_tmp=$(mktemp)
+printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$HELPER_DEST" >"$sudoers_tmp"
+if ! visudo -cf "$sudoers_tmp" >/dev/null; then
+  rm -f "$sudoers_tmp"
   die "generated sudoers entry failed validation"
 fi
-install -o root -g root -m 0440 "$tmp" "$SUDOERS"
-rm -f "$tmp"
-echo "installed $DEST with a NOPASSWD sudoers entry for $user"
+install -o root -g root -m 0440 "$sudoers_tmp" "$SUDOERS"
+rm -f "$sudoers_tmp"
+
+echo "installed $HELPER_DEST; approved ${#pairs[@]} route(s) for $user"
