@@ -208,13 +208,15 @@ recover_interrupted() {
         # impossible there), and removing it would be unrecoverable.
         if [[ -e $target && ! ( $backup != "-" && ! -f $backup && $cur == "$old" ) ]]; then
           if ! rm -f -- "$target" 2>/dev/null; then recovered=0; fi
-          # The revocation must be durable before any other target is
-          # touched, or a power loss could resurrect the grant beside
-          # partially persisted later mutations.
-          if ((recovered)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then recovered=0; fi
         fi
       fi
     done
+    # Prove the grant durably absent BEFORE any non-sudoers mutation — even
+    # when the pathname was already absent (a prior revoke's barrier may
+    # have failed), and even in the kept-old-grant case (harmless there).
+    if [[ -n $sudoers_entry ]]; then
+      if ((recovered)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then recovered=0; fi
+    fi
     restore_entry() { # restore_entry <entry> — uses/sets recovered
       IFS='|' read -r target backup old new <<<"$1"
       if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
@@ -311,18 +313,30 @@ if [[ ${1:-} == "--uninstall" ]]; then
     # grant is strictly privilege-reducing and consumes no recovery data
     # (any sudoers backup remains for recovery to restore or inspect).
     if [[ -e $SUDOERS ]] && target_ok "$SUDOERS"; then
-      if rm -f -- "$SUDOERS" 2>/dev/null; then
-        sync "$(dirname "$SUDOERS")" 2>/dev/null || true
-        echo "removed $SUDOERS (grant revoked despite pending recovery)"
+      if rm -f -- "$SUDOERS" 2>/dev/null && sync "$(dirname "$SUDOERS")" 2>/dev/null; then
+        echo "removed $SUDOERS (grant durably revoked despite pending recovery)"
+      else
+        die "could not durably revoke the grant; recovery state retained, nothing else touched"
       fi
     fi
     require_recovered
   fi
-  for f in "$SUDOERS" "$HELPER_DEST" "$APPROVE_DEST" "$ALLOW"; do
+  if [[ -e $SUDOERS || -L $SUDOERS ]]; then
+    require_target "$SUDOERS"
+    rm -f -- "$SUDOERS" || die "could not revoke the grant; nothing else touched"
+    echo "removed $SUDOERS"
+  fi
+  # The revocation barrier is unconditional and fatal: no other managed file
+  # is touched until the grant's absence is durable. A missing sudoers.d
+  # directory itself proves the grant absent with nothing pending to flush.
+  if [[ -d $(dirname "$SUDOERS") ]]; then
+    sync "$(dirname "$SUDOERS")" \
+      || die "could not make grant revocation durable; no other files were touched"
+  fi
+  for f in "$HELPER_DEST" "$APPROVE_DEST" "$ALLOW"; do
     if [[ -e $f || -L $f ]]; then
       require_target "$f"
       rm -f -- "$f"
-      if [[ $f == "$SUDOERS" ]]; then sync "$(dirname "$SUDOERS")" 2>/dev/null || true; fi
       echo "removed $f"
     fi
   done
@@ -431,9 +445,11 @@ rollback() {
     touched_sudoers=1
     if [[ -e $SUDOERS ]]; then
       if ! rm -f -- "$SUDOERS" 2>/dev/null; then rollback_ok=0; fi
-      # Revocation durable before any other mutation (see publication).
-      if ((rollback_ok)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then rollback_ok=0; fi
     fi
+    # Prove the grant durably absent BEFORE any non-sudoers mutation — even
+    # when the pathname is already absent, since a prior removal (e.g. a
+    # publication revoke whose own barrier failed) may not be durable yet.
+    if ((rollback_ok)) && ! sync "$(dirname "$SUDOERS")" 2>/dev/null; then rollback_ok=0; fi
   fi
   for ((i = ${#published[@]} - 1; i >= 0; i--)); do
     # Halt on the FIRST failure: continuing to rewrite targets after a

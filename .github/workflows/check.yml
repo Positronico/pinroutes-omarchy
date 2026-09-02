@@ -207,6 +207,22 @@ jobs:
           sudo umount "$S"
           sudo test -e "$S"; refute grep -q 10.7.0.0 "$A"
           sudo visudo -cf "$S"
-          # cleanup
+          # (6) second recovery with the grant path ALREADY ABSENT (a prior
+          # revoke whose barrier failed): unconditional barrier, restores,
+          # re-grant last, then proceeds
+          sudo /usr/local/bin/pinroutes-approve --approve 10.8.0.0/24 10.8.0.1
+          sudo cp -a "$S" "$(bak "$S" 41)"; sold=$(sudo sha256sum "$S" | cut -d" " -f1)
+          sudo cp -a "$A" "$(bak "$A" 41)"; aold=$(sha "$A")
+          printf '# managed-by: pinroutes\nX\n' | sudo tee "$A" >/dev/null
+          { printf '%s|%s|%s|%s\n' "$A" "$(bak "$A" 41)" "$aold" "$bogus"
+            printf '%s|%s|%s|%s\n' "$S" "$(bak "$S" 41)" "$sold" "$bogus"
+            iline "$H"; iline "$AP"; } | sudo tee "$J" >/dev/null
+          sudo rm "$S"
+          sudo /usr/local/bin/pinroutes-approve --approve 10.8.5.0/24 10.8.5.1 2>&1 | grep -qi recover
+          sudo grep -q NOSETENV "$S"; grep -q 10.8.5.0 "$A"; sudo test ! -e "$J"
+          # (7) normal uninstall with the grant path already absent still
+          # runs the unconditional revocation barrier, then removes the rest
+          sudo rm "$S"
           sudo /usr/local/bin/pinroutes-approve --uninstall
+          test ! -e "$H"; test ! -e "$AP"; test ! -e /etc/pinroutes/routes.allow
           echo "recovery matrix OK"
