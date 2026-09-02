@@ -158,13 +158,29 @@ recover_interrupted() {
   if ((all_new)) && [[ ${#entries[@]} -gt 0 ]]; then
     : # Every target is provably NEW: the transaction completed — commit.
   elif ((restorable)) && [[ ${#entries[@]} -gt 0 ]]; then
-    # Roll back to provably OLD everywhere.
-    local entry
+    # Roll back to provably OLD everywhere, with the grant-absent-first
+    # invariant: if a sudoers entry is recorded, remove any live grant
+    # BEFORE touching other targets, restore every non-sudoers target and
+    # make those restores durable, and only then re-grant from the verified
+    # sudoers backup. An interruption at any point leaves the grant absent
+    # or the state fully old — never a grant over a mixed set.
+    local entry sudoers_entry=""
     for entry in "${entries[@]}"; do
-      # Once any restore failed, stop mutating (notably: never restore the
-      # sudoers grant over a half-restored file set).
-      ((recovered)) || break
       IFS='|' read -r target backup old new <<<"$entry"
+      if [[ $target == "$SUDOERS" ]]; then
+        sudoers_entry=$entry
+        cur=$(if [[ -e $target ]]; then sha_of "$target" || echo UNREADABLE; else echo ABSENT; fi)
+        # Never self-revoke an already-restored OLD grant whose backup was
+        # consumed by a prior verified restore: that state only exists after
+        # every non-sudoers target was already restored (grant-over-mixed is
+        # impossible there), and removing it would be unrecoverable.
+        if [[ -e $target && ! ( $backup != "-" && ! -f $backup && $cur == "$old" ) ]]; then
+          if ! rm -f -- "$target" 2>/dev/null; then recovered=0; fi
+        fi
+      fi
+    done
+    restore_entry() { # restore_entry <entry> — uses/sets recovered
+      IFS='|' read -r target backup old new <<<"$1"
       if [[ $backup != "-" && -f $backup && ! -L $backup ]]; then
         if ! mv -fT -- "$backup" "$target" 2>/dev/null; then recovered=0; fi
       elif [[ $backup == "-" && -e $target ]]; then
@@ -179,7 +195,17 @@ recover_interrupted() {
           if ! [[ $cur == "$old" ]]; then recovered=0; fi
         fi
       fi
+    }
+    for entry in "${entries[@]}"; do
+      # Once any restore failed, stop mutating (the grant then stays absent).
+      ((recovered)) || break
+      [[ ${entry%%|*} == "$SUDOERS" ]] && continue # sudoers only ever last
+      restore_entry "$entry"
     done
+    if [[ -n $sudoers_entry ]] && ((recovered)); then
+      if ! sync /usr/local/bin "$ALLOW_DIR" 2>/dev/null; then recovered=0; fi
+      if ((recovered)); then restore_entry "$sudoers_entry"; fi
+    fi
   else
     recovered=0 # mixed/unprovable state: keep everything, refuse below
   fi
@@ -356,13 +382,22 @@ publish() { # publish <staged> <target> — backups were all taken up front
 
 rollback_ok=1
 rollback() {
-  local i t entry backup target had_backup seen=" "
+  local i t entry backup target had_backup seen=" " touched_sudoers=0
   rollback_ok=1
+  # Grant-absent-first invariant, mirrored from publication: if the sudoers
+  # file was touched at all this run, make the grant ABSENT before restoring
+  # anything else, and re-grant (from backup) only LAST, after every other
+  # target is restored and the restores are durable. An interrupted rollback
+  # therefore never leaves a passwordless grant over a mixed component set.
+  if [[ " ${published[*]-} " == *" $SUDOERS "* ]]; then
+    touched_sudoers=1
+    if [[ -e $SUDOERS ]] && ! rm -f -- "$SUDOERS" 2>/dev/null; then rollback_ok=0; fi
+  fi
   for ((i = ${#published[@]} - 1; i >= 0; i--)); do
     t=${published[i]}
-    # A target can appear twice (sudoers: revoke, then new publish) — only
-    # the most recent action per target is undone, or the restored backup
-    # would be deleted again by the earlier entry.
+    [[ $t == "$SUDOERS" ]] && continue # handled last, below
+    # A target can appear twice — only the most recent action per target is
+    # undone, or the restored backup would be deleted again.
     [[ $seen == *" $t "* ]] && continue
     seen="$seen$t "
     had_backup=0
@@ -382,6 +417,19 @@ rollback() {
       if ! rm -f -- "$t" 2>/dev/null; then rollback_ok=0; fi
     fi
   done
+  # Re-grant last, only after everything else succeeded and is durable.
+  if ((touched_sudoers)) && ((rollback_ok)); then
+    if ! sync /usr/local/bin "$ALLOW_DIR" 2>/dev/null; then rollback_ok=0; fi
+    if ((rollback_ok)); then
+      for entry in ${backups[@]+"${backups[@]}"}; do
+        backup=${entry%%|*} target=${entry#*|}
+        if [[ $target == "$SUDOERS" ]]; then
+          if [[ -e $backup ]] && ! mv -fT -- "$backup" "$target" 2>/dev/null; then rollback_ok=0; fi
+          break
+        fi
+      done
+    fi
+  fi
   published=()
 }
 
@@ -540,10 +588,16 @@ stage_into sudoers_tmp "$(dirname "$SUDOERS")"
   printf '# %s\n' "$MARKER"
   printf '# grants uid %s (%s)\n' "$uid" "$user"
   printf 'Defaults!%s secure_path="/usr/sbin:/usr/bin:/sbin:/bin"\n' "$HELPER_DEST"
+  # Interpreter-startup environment can never reach the root bash: these are
+  # deleted even under a site policy of !env_reset.
+  printf 'Defaults!%s env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PINROUTES_DEADLINE"\n' "$HELPER_DEST"
+  printf 'Defaults!%s env_keep -= "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PINROUTES_DEADLINE"\n' "$HELPER_DEST"
+  printf 'Defaults!%s env_check -= "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PINROUTES_DEADLINE"\n' "$HELPER_DEST"
   # The numeric #uid User_List form: account NAMES are attacker-choosable
   # policy tokens (a local user literally named "ALL" would change the rule
-  # subject), a validated numeric uid is not.
-  printf '#%s ALL=(root) NOPASSWD: %s\n' "$uid" "$HELPER_DEST"
+  # subject), a validated numeric uid is not. NOSETENV pins the rule against
+  # ambient or user-scoped SETENV defaults.
+  printf '#%s ALL=(root) NOSETENV: NOPASSWD: %s\n' "$uid" "$HELPER_DEST"
 } >"$sudoers_tmp"
 
 # ---- validate everything before publishing anything ------------------------

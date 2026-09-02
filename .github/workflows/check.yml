@@ -88,7 +88,15 @@ jobs:
           grep -qxF '10.0.0.0/24 10.0.0.1' /etc/pinroutes/routes.allow
           sudo grep -q 'secure_path' /etc/sudoers.d/pinroutes
           sudo grep -q 'managed-by: pinroutes' /etc/sudoers.d/pinroutes
-          sudo grep -Eq '^#[0-9]+ ALL=\(root\) NOPASSWD:' /etc/sudoers.d/pinroutes
+          sudo grep -Eq '^#[0-9]+ ALL=\(root\) NOSETENV: NOPASSWD:' /etc/sudoers.d/pinroutes
+          sudo grep -q 'env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PINROUTES_DEADLINE"' /etc/sudoers.d/pinroutes
+          sudo grep -q 'env_keep -= "BASH_ENV' /etc/sudoers.d/pinroutes
+          # NOSETENV behavior, not just text: -E must be refused, and a
+          # caller BASH_ENV must never execute in the root shell
+          expect 1 sudo -n -E /usr/local/bin/pinroutes-helper delete 10.0.0.0/24 10.0.0.1
+          echo 'touch /tmp/pinroutes-canary-executed' > /tmp/pinroutes-canary.sh
+          BASH_ENV=/tmp/pinroutes-canary.sh sudo -n /usr/local/bin/pinroutes-helper delete 10.0.0.0/24 10.0.0.1
+          test ! -e /tmp/pinroutes-canary-executed
           sudo visudo -cf /etc/sudoers.d/pinroutes
           sudo test ! -e /etc/pinroutes/.pinroutes-txn  # journal committed away
           # No staging leftovers
