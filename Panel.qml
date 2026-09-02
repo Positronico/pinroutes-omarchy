@@ -38,7 +38,7 @@ Panel {
   function statusLabel(status) {
     if (status === "active") return "pinned"
     if (status === "missing") return "missing"
-    if (status === "standby") return "standby — gateway unreachable"
+    if (status === "standby") return "standby"
     if (status === "disabled") return "disabled"
     return "checking"
   }
@@ -529,13 +529,24 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          // Standby drops the "via <gw>" so the reason survives eliding.
+          // Standby gets its own line below; keep this one to the route itself.
           text: {
             if (!routeRow.rule) return ""
-            if (routeRow.status === "standby") return routeRow.rule.network + " · gateway unreachable"
+            if (routeRow.status === "standby") return routeRow.rule.network + " via " + routeRow.rule.gateway
             return routeRow.rule.network + " via " + routeRow.rule.gateway + " · " + root.statusLabel(routeRow.status)
           }
           color: routeRow.status === "missing" ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          visible: routeRow.status === "standby"
+          text: "󰒲 gateway unreachable"
+          color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
